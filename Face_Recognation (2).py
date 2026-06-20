@@ -105,8 +105,8 @@ def align_face(gray: np.ndarray, face_box) -> np.ndarray:
     angle = np.degrees(np.arctan2(dy, dx))
 
     # Rotasi seluruh gambar grayscale di sekitar pusat wajah, lalu crop ulang
-    center = (x + w // 2, y + h // 2)
-    rot_mat = cv2.getRotationMatrix2D(center, angle, 1.0)
+    center = (float(x + w // 2), float(y + h // 2))
+    rot_mat = cv2.getRotationMatrix2D(center, float(angle), 1.0)
     rotated = cv2.warpAffine(gray, rot_mat, (gray.shape[1], gray.shape[0]),
                               flags=cv2.INTER_LINEAR)
 
