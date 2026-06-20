@@ -13,10 +13,15 @@ Deploy ke Streamlit Community Cloud:
     2. Buka share.streamlit.io -> New app -> pilih repo & app.py
     3. Selesai, Streamlit Cloud otomatis install requirements.txt & jalankan
 
-Format ZIP dataset:
-    Semua foto rata (tanpa folder), nama file = "namaorang_nomor.ext"
-    Contoh: andi_1.jpg, andi_2.jpg, budi_1.jpg, budi_2.png, siti_1.jpeg ...
-    Nama orang diambil dari bagian sebelum underscore + angka terakhir.
+Format ZIP dataset (dua mode, dideteksi otomatis):
+    1. Folder per orang:
+       dataset.zip/andi/foto1.jpg, dataset.zip/andi/foto2.jpg
+       dataset.zip/budi/apapun_namanya.png
+       -> Nama folder = label orang, nama file di dalamnya bebas.
+
+    2. File rata (flat):
+       dataset.zip/andi_1.jpg, dataset.zip/budi_1.jpg
+       -> Label diambil dari nama file sebelum angka terakhir.
 """
 
 import streamlit as st
@@ -133,53 +138,144 @@ def create_synthetic_dataset(n_persons=5, n_images=8, log_fn=None):
 # DATASET DARI ZIP UPLOAD
 # ─────────────────────────────────────────────
 
+def detect_zip_structure(extract_dir: str) -> str:
+    """
+    Deteksi struktur dataset di dalam folder hasil ekstrak ZIP.
+    Return 'folder' jika gambar tersusun dalam subfolder per orang,
+    atau 'flat' jika semua gambar rata di root (atau campur tanpa subfolder konsisten).
+    """
+    root_items = os.listdir(extract_dir)
+    # Lewati folder sampah macOS / hidden
+    root_items = [i for i in root_items if not i.startswith(".") and i != "__MACOSX"]
+
+    subfolders = [i for i in root_items if os.path.isdir(os.path.join(extract_dir, i))]
+    root_images = [
+        i for i in root_items
+        if os.path.isfile(os.path.join(extract_dir, i))
+        and os.path.splitext(i)[1].lower() in ALLOWED_EXT
+    ]
+
+    # Jika ada subfolder dan masing-masing berisi gambar -> struktur folder per orang
+    if len(subfolders) >= 1:
+        for sub in subfolders:
+            sub_path = os.path.join(extract_dir, sub)
+            has_image = any(
+                os.path.splitext(f)[1].lower() in ALLOWED_EXT
+                for f in os.listdir(sub_path)
+                if os.path.isfile(os.path.join(sub_path, f))
+            )
+            if has_image:
+                return "folder"
+
+    # Jika ada gambar langsung di root tanpa subfolder -> flat
+    if len(root_images) > 0:
+        return "flat"
+
+    # Fallback: kalau subfolder ada tapi kosong, tetap coba treat sebagai folder
+    # (mungkin gambar ada di nested subfolder lagi)
+    if len(subfolders) >= 1:
+        return "folder"
+
+    return "flat"
+
+
 def load_dataset_from_zip(zip_bytes: bytes, log_fn=None):
     """
-    Ekstrak ZIP (dari bytes di memori), baca semua gambar (flat scan ke semua subfolder),
-    label diambil dari nama file pakai extract_label_from_filename().
+    Ekstrak ZIP (dari bytes di memori), lalu baca dataset dengan dua mode yang
+    dideteksi otomatis:
+
+    1. MODE FOLDER  -> dataset.zip/nama_orang/foto1.jpg, foto2.jpg, ...
+       Nama folder langsung dipakai sebagai label. Nama file di dalam folder bebas.
+
+    2. MODE FLAT    -> dataset.zip/namaorang_nomor.jpg (semua rata, tanpa folder)
+       Label diambil dari nama file pakai extract_label_from_filename().
     """
-    if log_fn: log_fn("Mengekstrak dan membaca dataset dari ZIP...")
+    if log_fn: log_fn("Mengekstrak dataset dari ZIP...")
 
     extract_dir = tempfile.mkdtemp(prefix="faceds_")
     try:
         with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as zf:
             zf.extractall(extract_dir)
 
+        structure = detect_zip_structure(extract_dir)
+        if log_fn:
+            mode_label = "Folder per orang" if structure == "folder" else "File rata (flat)"
+            log_fn(f"  Struktur terdeteksi: {mode_label}")
+
         X, labels = [], []
         skipped = 0
 
-        for root, _, files in os.walk(extract_dir):
-            for fname in sorted(files):
-                ext = os.path.splitext(fname)[1].lower()
-                if ext not in ALLOWED_EXT:
-                    continue
-                if fname.startswith("._") or fname.startswith("."):
-                    continue
+        if structure == "folder":
+            # Setiap subfolder langsung di bawah extract_dir = satu orang.
+            # Gambar di dalamnya (termasuk nested) semua dianggap milik orang itu.
+            root_items = sorted(os.listdir(extract_dir))
+            person_folders = [
+                i for i in root_items
+                if os.path.isdir(os.path.join(extract_dir, i))
+                and not i.startswith(".") and i != "__MACOSX"
+            ]
 
-                fpath = os.path.join(root, fname)
-                img = cv2.imread(fpath)
-                if img is None:
-                    skipped += 1
-                    continue
+            for person_name in person_folders:
+                label = person_name.strip().lower().replace(" ", "_")
+                person_path = os.path.join(extract_dir, person_name)
 
-                try:
-                    vec = preprocess_image(img, use_face_detection=True)
-                except Exception:
-                    skipped += 1
-                    continue
+                for root, _, files in os.walk(person_path):
+                    for fname in sorted(files):
+                        ext = os.path.splitext(fname)[1].lower()
+                        if ext not in ALLOWED_EXT or fname.startswith("."):
+                            continue
 
-                label = extract_label_from_filename(fname)
-                X.append(vec)
-                labels.append(label)
+                        fpath = os.path.join(root, fname)
+                        img = cv2.imread(fpath)
+                        if img is None:
+                            skipped += 1
+                            continue
+                        try:
+                            vec = preprocess_image(img, use_face_detection=True)
+                        except Exception:
+                            skipped += 1
+                            continue
+
+                        X.append(vec)
+                        labels.append(label)
+
+        else:  # flat
+            for root, _, files in os.walk(extract_dir):
+                for fname in sorted(files):
+                    ext = os.path.splitext(fname)[1].lower()
+                    if ext not in ALLOWED_EXT:
+                        continue
+                    if fname.startswith("._") or fname.startswith("."):
+                        continue
+
+                    fpath = os.path.join(root, fname)
+                    img = cv2.imread(fpath)
+                    if img is None:
+                        skipped += 1
+                        continue
+
+                    try:
+                        vec = preprocess_image(img, use_face_detection=True)
+                    except Exception:
+                        skipped += 1
+                        continue
+
+                    label = extract_label_from_filename(fname)
+                    X.append(vec)
+                    labels.append(label)
 
         if len(X) == 0:
-            raise ValueError("Tidak ada gambar valid ditemukan di dalam ZIP")
+            raise ValueError(
+                "Tidak ada gambar valid ditemukan di dalam ZIP. "
+                "Pastikan struktur folder per orang (nama_orang/foto.jpg) "
+                "atau nama file flat (nama_orang_nomor.jpg) sudah benar."
+            )
 
         unique_labels = sorted(set(labels))
         if log_fn:
             log_fn(f"  ✓ {len(X)} gambar berhasil dibaca, {len(unique_labels)} orang terdeteksi")
             if skipped > 0:
-                log_fn(f"  ⚠ {skipped} file dilewati (gagal dibaca / format tidak didukung)")
+                log_fn(f"  ⚠ {skipped} file dilewati (gagal dibaca / wajah tidak terdeteksi)")
             for lbl in unique_labels:
                 count = labels.count(lbl)
                 log_fn(f"    - {lbl}: {count} foto")
@@ -361,9 +457,14 @@ with tab_train:
     else:  # Upload ZIP
         st.markdown("""
         <div class="format-hint">
-        📋 <strong>Format ZIP:</strong> semua foto rata (tanpa folder), nama file = <code>namaorang_nomor.ext</code><br>
-        Contoh: <code>andi_1.jpg</code>, <code>andi_2.jpg</code>, <code>budi_1.png</code>, <code>siti_wulan_1.jpg</code><br>
-        Minimal 2 orang berbeda. Format gambar yang didukung: jpg, jpeg, png, bmp, webp
+        📋 <strong>Format ZIP yang didukung (otomatis terdeteksi):</strong><br><br>
+        <strong>1. Folder per orang</strong> (direkomendasikan untuk dataset besar)<br>
+        <code>dataset.zip/andi/foto1.jpg</code>, <code>dataset.zip/andi/foto2.jpg</code><br>
+        <code>dataset.zip/budi/apa_saja.png</code> — nama folder = nama orang<br><br>
+        <strong>2. File rata (flat)</strong><br>
+        <code>dataset.zip/andi_1.jpg</code>, <code>dataset.zip/budi_1.png</code><br>
+        — nama orang diambil dari nama file sebelum angka terakhir<br><br>
+        Minimal 2 orang berbeda. Format gambar: jpg, jpeg, png, bmp, webp
         </div>
         """, unsafe_allow_html=True)
         st.write("")
