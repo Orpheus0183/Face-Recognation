@@ -5,22 +5,22 @@ Aplikasi web untuk training model PCA/SVD dari dataset wajah (sintetis atau uplo
 lalu membandingkan dua foto untuk menentukan apakah orang yang sama.
 
 Cara jalankan lokal:
-    pip install streamlit opencv-python-headless numpy scikit-learn pillow
+    pip install streamlit opencv-python-headless numpy scikit-learn pillow py7zr
     streamlit run app.py
 
 Deploy ke Streamlit Community Cloud:
-    1. Push app.py + requirements.txt ke GitHub repo
+    1. Push app.py + requirements.txt (+ .streamlit/config.toml) ke GitHub repo
     2. Buka share.streamlit.io -> New app -> pilih repo & app.py
     3. Selesai, Streamlit Cloud otomatis install requirements.txt & jalankan
 
-Format ZIP dataset (dua mode, dideteksi otomatis):
+Format arsip dataset yang didukung: .zip dan .7z (dua mode struktur, dideteksi otomatis):
     1. Folder per orang:
-       dataset.zip/andi/foto1.jpg, dataset.zip/andi/foto2.jpg
-       dataset.zip/budi/apapun_namanya.png
+       dataset/andi/foto1.jpg, dataset/andi/foto2.jpg
+       dataset/budi/apapun_namanya.png
        -> Nama folder = label orang, nama file di dalamnya bebas.
 
     2. File rata (flat):
-       dataset.zip/andi_1.jpg, dataset.zip/budi_1.jpg
+       dataset/andi_1.jpg, dataset/budi_1.jpg
        -> Label diambil dari nama file sebelum angka terakhir.
 """
 
@@ -32,6 +32,12 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics.pairwise import cosine_similarity, euclidean_distances
 from PIL import Image
 import io, os, re, zipfile, tempfile, shutil
+
+try:
+    import py7zr
+    PY7ZR_AVAILABLE = True
+except ImportError:
+    PY7ZR_AVAILABLE = False
 
 # ── Konfigurasi ──────────────────────────────
 IMG_SIZE       = (80, 80)     # disesuaikan dgn resolusi sumber foto publik figur (~50-60px asli)
@@ -360,23 +366,38 @@ def detect_zip_structure(root_dir: str) -> str:
     return "flat"
 
 
-def load_dataset_from_zip(zip_bytes: bytes, log_fn=None):
+def load_dataset_from_archive(archive_bytes: bytes, filename: str, log_fn=None):
     """
-    Ekstrak ZIP (dari bytes di memori), lalu baca dataset dengan dua mode yang
-    dideteksi otomatis:
+    Ekstrak file arsip (.zip atau .7z, dari bytes di memori), lalu baca dataset
+    dengan dua mode yang dideteksi otomatis:
 
-    1. MODE FOLDER  -> dataset.zip/nama_orang/foto1.jpg, foto2.jpg, ...
+    1. MODE FOLDER  -> arsip/nama_orang/foto1.jpg, foto2.jpg, ...
        Nama folder langsung dipakai sebagai label. Nama file di dalam folder bebas.
 
-    2. MODE FLAT    -> dataset.zip/namaorang_nomor.jpg (semua rata, tanpa folder)
+    2. MODE FLAT    -> arsip/namaorang_nomor.jpg (semua rata, tanpa folder)
        Label diambil dari nama file pakai extract_label_from_filename().
     """
-    if log_fn: log_fn("Mengekstrak dataset dari ZIP...")
+    ext = os.path.splitext(filename)[1].lower()
+
+    if log_fn: log_fn(f"Mengekstrak dataset dari {ext.upper().lstrip('.')}...")
 
     extract_dir = tempfile.mkdtemp(prefix="faceds_")
     try:
-        with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as zf:
-            zf.extractall(extract_dir)
+        if ext == ".zip":
+            with zipfile.ZipFile(io.BytesIO(archive_bytes), "r") as zf:
+                zf.extractall(extract_dir)
+
+        elif ext == ".7z":
+            if not PY7ZR_AVAILABLE:
+                raise ValueError(
+                    "Library py7zr belum terpasang di server. "
+                    "Tambahkan 'py7zr' ke requirements.txt lalu reboot app."
+                )
+            with py7zr.SevenZipFile(io.BytesIO(archive_bytes), mode="r") as sz:
+                sz.extractall(path=extract_dir)
+
+        else:
+            raise ValueError(f"Format file '{ext}' tidak didukung. Gunakan .zip atau .7z")
 
         # Tembus folder pembungkus tunggal, mis. "Extracted/" yang isinya
         # langsung folder-per-orang, supaya tidak salah dianggap "1 orang".
@@ -640,7 +661,7 @@ with tab_train:
 
     method = st.radio(
         "Pilih metode dataset",
-        ["🎲 Dataset Sintetis", "📦 Upload ZIP"],
+        ["🎲 Dataset Sintetis", "📦 Upload Arsip (ZIP/7z)"],
         horizontal=True,
         label_visibility="collapsed",
     )
@@ -674,31 +695,32 @@ with tab_train:
                 log_box.code("\n".join(st.session_state.train_log))
                 st.error(str(e))
 
-    else:  # Upload ZIP
+    else:  # Upload Arsip
         st.markdown("""
         <div class="format-hint">
-        📋 <strong>Format ZIP yang didukung (otomatis terdeteksi):</strong><br><br>
+        📋 <strong>Format arsip yang didukung:</strong> <code>.zip</code> dan <code>.7z</code><br><br>
+        <strong>Struktur isi (otomatis terdeteksi):</strong><br><br>
         <strong>1. Folder per orang</strong> (direkomendasikan untuk dataset besar)<br>
-        <code>dataset.zip/andi/foto1.jpg</code>, <code>dataset.zip/andi/foto2.jpg</code><br>
-        <code>dataset.zip/budi/apa_saja.png</code> — nama folder = nama orang<br><br>
+        <code>dataset/andi/foto1.jpg</code>, <code>dataset/andi/foto2.jpg</code><br>
+        <code>dataset/budi/apa_saja.png</code> — nama folder = nama orang<br><br>
         <strong>2. File rata (flat)</strong><br>
-        <code>dataset.zip/andi_1.jpg</code>, <code>dataset.zip/budi_1.png</code><br>
+        <code>dataset/andi_1.jpg</code>, <code>dataset/budi_1.png</code><br>
         — nama orang diambil dari nama file sebelum angka terakhir<br><br>
         Minimal 2 orang berbeda. Format gambar: jpg, jpeg, png, bmp, webp
         </div>
         """, unsafe_allow_html=True)
         st.write("")
 
-        zip_file = st.file_uploader("Upload file ZIP dataset", type=["zip"])
+        archive_file = st.file_uploader("Upload file dataset (.zip atau .7z)", type=["zip", "7z"])
 
-        if st.button("🚀 Mulai Training (dari ZIP)", type="primary",
-                      use_container_width=True, disabled=(zip_file is None)):
+        if st.button("🚀 Mulai Training (dari Arsip)", type="primary",
+                      use_container_width=True, disabled=(archive_file is None)):
             st.session_state.train_log = []
             log_box = st.empty()
             try:
                 with st.spinner("Mengekstrak dan training..."):
-                    zip_bytes = zip_file.read()
-                    X, labels = load_dataset_from_zip(zip_bytes, log_fn=log)
+                    archive_bytes = archive_file.read()
+                    X, labels = load_dataset_from_archive(archive_bytes, archive_file.name, log_fn=log)
                     log_box.code("\n".join(st.session_state.train_log))
                     model = run_training(X, labels, log_fn=log)
                     log_box.code("\n".join(st.session_state.train_log))
