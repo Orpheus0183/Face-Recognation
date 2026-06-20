@@ -28,14 +28,20 @@ import streamlit as st
 import cv2
 import numpy as np
 from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
 from sklearn.metrics.pairwise import cosine_similarity, euclidean_distances
 from PIL import Image
 import io, os, re, zipfile, tempfile, shutil
 
 # ── Konfigurasi ──────────────────────────────
-IMG_SIZE     = (100, 100)
-N_COMPONENTS = 50
-ALLOWED_EXT  = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+IMG_SIZE       = (80, 80)     # disesuaikan dgn resolusi sumber foto publik figur (~50-60px asli)
+N_COMPONENTS   = 60           # diturunkan sedikit mengikuti dimensi fitur yg juga lebih kecil
+ALLOWED_EXT    = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+# Parameter LBP (Local Binary Pattern) -> fitur tekstur tahan-cahaya
+LBP_RADIUS     = 2
+LBP_N_POINTS   = 8 * LBP_RADIUS
+LBP_GRID       = (6, 6)       # grid lebih kecil krn IMG_SIZE juga lebih kecil (80x80)
 
 st.set_page_config(
     page_title="Face Match ML",
@@ -45,7 +51,7 @@ st.set_page_config(
 
 
 # ─────────────────────────────────────────────
-# PREPROCESSING
+# PREPROCESSING — FACE ALIGNMENT
 # ─────────────────────────────────────────────
 
 @st.cache_resource(show_spinner=False)
@@ -53,31 +59,182 @@ def get_face_cascade():
     return cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
 
 
-def preprocess_image(img: np.ndarray, use_face_detection=True) -> np.ndarray:
+@st.cache_resource(show_spinner=False)
+def get_eye_cascade():
+    return cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_eye.xml")
+
+
+def detect_face_box(gray: np.ndarray):
+    """Cari kotak wajah terbesar. Return (x,y,w,h) atau None."""
+    cascade = get_face_cascade()
+    faces = cascade.detectMultiScale(gray, 1.1, 4, minSize=(30, 30))
+    if len(faces) == 0:
+        return None
+    faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
+    return faces[0]
+
+
+def align_face(gray: np.ndarray, face_box) -> np.ndarray:
+    """
+    Luruskan wajah berdasarkan posisi dua mata, supaya foto dengan kepala
+    miring/beda sudut bisa dibandingkan secara piksel-sejajar dengan foto frontal.
+    Kalau mata tidak terdeteksi, kembalikan crop wajah apa adanya (fallback).
+    """
+    x, y, w, h = face_box
+    face_roi = gray[y:y + h, x:x + w]
+
+    eye_cascade = get_eye_cascade()
+    eyes = eye_cascade.detectMultiScale(face_roi, 1.1, 5, minSize=(int(w*0.12), int(h*0.12)))
+
+    if len(eyes) < 2:
+        return face_roi  # fallback: tanpa alignment
+
+    # Ambil 2 mata terbesar, urutkan kiri-kanan
+    eyes = sorted(eyes, key=lambda e: e[2] * e[3], reverse=True)[:2]
+    eyes = sorted(eyes, key=lambda e: e[0])
+    (ex1, ey1, ew1, eh1), (ex2, ey2, ew2, eh2) = eyes
+
+    # Titik tengah tiap mata (koordinat relatif terhadap face_roi)
+    left_eye  = (ex1 + ew1 // 2, ey1 + eh1 // 2)
+    right_eye = (ex2 + ew2 // 2, ey2 + eh2 // 2)
+
+    dx = right_eye[0] - left_eye[0]
+    dy = right_eye[1] - left_eye[1]
+    if dx == 0:
+        return face_roi
+    angle = np.degrees(np.arctan2(dy, dx))
+
+    # Rotasi seluruh gambar grayscale di sekitar pusat wajah, lalu crop ulang
+    center = (x + w // 2, y + h // 2)
+    rot_mat = cv2.getRotationMatrix2D(center, angle, 1.0)
+    rotated = cv2.warpAffine(gray, rot_mat, (gray.shape[1], gray.shape[0]),
+                              flags=cv2.INTER_LINEAR)
+
+    # Deteksi ulang wajah pada gambar yang sudah diluruskan (lebih akurat)
+    aligned_box = detect_face_box(rotated)
+    if aligned_box is not None:
+        ax, ay, aw, ah = aligned_box
+        return rotated[ay:ay + ah, ax:ax + aw]
+
+    return rotated[y:y + h, x:x + w]
+
+
+def normalize_lighting(gray: np.ndarray) -> np.ndarray:
+    """Histogram equalization (CLAHE) -> menyamakan kontras/pencahayaan antar foto."""
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+    return clahe.apply(gray)
+
+
+def get_aligned_face(img: np.ndarray, use_face_detection=True) -> np.ndarray:
+    """
+    Pipeline lengkap: grayscale -> deteksi wajah -> alignment (mata) ->
+    equalization -> resize ke IMG_SIZE. Return grayscale 2D array (bukan flatten).
+    """
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
     if use_face_detection:
-        cascade = get_face_cascade()
-        faces = cascade.detectMultiScale(gray, 1.1, 4, minSize=(30, 30))
-        if len(faces) > 0:
-            faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
-            x, y, w, h = faces[0]
-            gray = gray[y:y + h, x:x + w]
-    return cv2.resize(gray, IMG_SIZE).astype(np.float64).flatten() / 255.0
+        face_box = detect_face_box(gray)
+        if face_box is not None:
+            gray = align_face(gray, face_box)
+
+    gray = cv2.resize(gray, IMG_SIZE)
+    gray = normalize_lighting(gray)
+    return gray
+
+
+# ─────────────────────────────────────────────
+# PREPROCESSING — FITUR: PIKSEL + LBP
+# ─────────────────────────────────────────────
+
+def compute_lbp(gray: np.ndarray, radius=LBP_RADIUS, n_points=LBP_N_POINTS) -> np.ndarray:
+    """
+    Local Binary Pattern manual (tanpa dependency skimage).
+    Untuk tiap piksel, bandingkan dengan n_points tetangga di sekeliling radius
+    -> encode sebagai pola biner -> hasil tahan terhadap perubahan pencahayaan
+    karena yang dibandingkan adalah relasi terang/gelap, bukan nilai absolut.
+    """
+    h, w = gray.shape
+    # n_points bisa sampai 16 (radius=2) -> nilai LBP maksimum 2^16-1,
+    # jadi pakai uint32 supaya tidak overflow.
+    lbp = np.zeros((h, w), dtype=np.uint32)
+    gray_f = gray.astype(np.float64)
+
+    angles = [2 * np.pi * p / n_points for p in range(n_points)]
+    offsets = [(radius * np.cos(a), -radius * np.sin(a)) for a in angles]
+
+    padded = np.pad(gray_f, radius, mode="edge")
+
+    for p, (dx, dy) in enumerate(offsets):
+        map_x = (np.arange(w) + radius + dx).astype(np.float32)
+        map_y = (np.arange(h) + radius + dy).astype(np.float32)
+        map_x, map_y = np.meshgrid(map_x, map_y)
+        sampled = cv2.remap(padded.astype(np.float32), map_x, map_y, cv2.INTER_LINEAR)
+        bit = (sampled >= gray_f).astype(np.uint32)
+        lbp += (bit << p)
+
+    return lbp
+
+
+def lbp_histogram_features(gray: np.ndarray, grid=LBP_GRID) -> np.ndarray:
+    """
+    Hitung histogram LBP per sel grid, lalu gabungkan jadi satu vektor fitur.
+    Nilai LBP mentah (0 .. 2^n_points-1) di-bin ulang ke 256 bucket supaya
+    panjang vektor fitur tetap terkendali walau n_points besar.
+    """
+    lbp = compute_lbp(gray)
+    h, w = lbp.shape
+    gh, gw = grid
+    cell_h, cell_w = h // gh, w // gw
+
+    max_val = 2 ** LBP_N_POINTS
+    n_bins = min(max_val, 256)
+    # Skala nilai LBP mentah ke rentang [0, n_bins) sebelum histogram
+    lbp_scaled = (lbp.astype(np.float64) / max_val * n_bins).astype(np.int64)
+    lbp_scaled = np.clip(lbp_scaled, 0, n_bins - 1)
+
+    hist_all = []
+    for i in range(gh):
+        for j in range(gw):
+            cell = lbp_scaled[i*cell_h:(i+1)*cell_h, j*cell_w:(j+1)*cell_w]
+            hist, _ = np.histogram(cell.flatten(), bins=n_bins, range=(0, n_bins))
+            hist = hist.astype(np.float64)
+            hist /= (hist.sum() + 1e-7)  # normalisasi per sel
+            hist_all.append(hist)
+
+    return np.concatenate(hist_all)
+
+
+def preprocess_image(img: np.ndarray, use_face_detection=True) -> np.ndarray:
+    """
+    Pipeline preprocessing final: alignment + equalization, lalu gabungkan
+    dua jenis fitur:
+      1. Piksel mentah ternormalisasi (menangkap bentuk/struktur wajah)
+      2. Histogram LBP (menangkap tekstur, tahan terhadap variasi cahaya)
+    Hasil akhir adalah satu vektor 1D gabungan keduanya.
+    """
+    aligned = get_aligned_face(img, use_face_detection=use_face_detection)
+
+    pixel_features = aligned.astype(np.float64).flatten() / 255.0
+    lbp_features = lbp_histogram_features(aligned)
+
+    # Bobot LBP diperkecil relatif (lebih banyak sel tapi tiap nilai histogram
+    # kecil) supaya tidak mendominasi dimensi vs fitur piksel.
+    return np.concatenate([pixel_features, lbp_features])
 
 
 def get_face_crop(img: np.ndarray) -> np.ndarray:
-    """Crop wajah untuk preview (return BGR array, bukan base64)."""
+    """Crop wajah (sudah di-align) untuk preview, dikembalikan sebagai BGR berwarna."""
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    cascade = get_face_cascade()
-    faces = cascade.detectMultiScale(gray, 1.1, 4, minSize=(30, 30))
-    crop = img
-    if len(faces) > 0:
-        faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
-        x, y, w, h = faces[0]
-        pad = int(min(w, h) * 0.15)
-        x1, y1 = max(0, x - pad), max(0, y - pad)
-        x2, y2 = min(img.shape[1], x + w + pad), min(img.shape[0], y + h + pad)
-        crop = img[y1:y2, x1:x2]
+    face_box = detect_face_box(gray)
+
+    if face_box is None:
+        return cv2.resize(img, (200, 200))
+
+    x, y, w, h = face_box
+    pad = int(min(w, h) * 0.15)
+    x1, y1 = max(0, x - pad), max(0, y - pad)
+    x2, y2 = min(img.shape[1], x + w + pad), min(img.shape[0], y + h + pad)
+    crop = img[y1:y2, x1:x2]
     return cv2.resize(crop, (200, 200))
 
 
@@ -330,32 +487,64 @@ def run_training(X: np.ndarray, labels: np.ndarray, log_fn=None):
 
     if log_fn: log_fn(f"\nDataset: {X.shape[0]} gambar | {n_unique} orang | dimensi {X.shape[1]}")
 
+    # Standardisasi fitur sebelum PCA. Penting karena fitur gabungan piksel + LBP
+    # punya skala berbeda -> tanpa ini PCA bisa bias ke salah satu jenis fitur.
+    if log_fn: log_fn("\nStandardisasi fitur (piksel + LBP)...")
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
     n_comp = min(N_COMPONENTS, X.shape[0] - 1, X.shape[1])
     if log_fn: log_fn(f"\nTraining PCA dengan {n_comp} komponen...")
 
     pca = PCA(n_components=n_comp, svd_solver="full")
-    X_pca = pca.fit_transform(X)
+    X_pca = pca.fit_transform(X_scaled)
 
     explained = float(np.sum(pca.explained_variance_ratio_)) * 100
     if log_fn:
         log_fn(f"  ✓ Explained variance: {explained:.1f}%")
         log_fn(f"  ✓ Dimensi PCA: {X_pca.shape}")
+
+    # Kalibrasi skala jarak euclidean dari data training itu sendiri, supaya
+    # threshold "mirip" tidak pakai angka tetap yang sensitif terhadap
+    # perubahan jumlah komponen / jenis fitur.
+    sample_n = min(300, X_pca.shape[0])
+    idx = np.random.default_rng(42).choice(X_pca.shape[0], size=sample_n, replace=False)
+    sample_dists = euclidean_distances(X_pca[idx])
+    upper_tri = sample_dists[np.triu_indices(sample_n, k=1)]
+    dist_scale = float(np.percentile(upper_tri, 90)) if len(upper_tri) > 0 else 30.0
+    dist_scale = max(dist_scale, 1e-6)
+
+    if log_fn:
+        log_fn(f"  ✓ Skala jarak euclidean terkalibrasi: {dist_scale:.2f}")
         log_fn(f"\n✅ Model berhasil ditraining! Siap membandingkan wajah.")
 
-    return {"pca": pca, "X_pca": X_pca, "labels": labels}
+    return {
+        "pca": pca,
+        "scaler": scaler,
+        "X_pca": X_pca,
+        "labels": labels,
+        "dist_scale": dist_scale,
+    }
 
 
 def compare_faces(model: dict, img1: np.ndarray, img2: np.ndarray) -> dict:
     vec1 = preprocess_image(img1)
     vec2 = preprocess_image(img2)
 
+    scaler = model["scaler"]
     pca = model["pca"]
-    z1 = pca.transform(vec1.reshape(1, -1))
-    z2 = pca.transform(vec2.reshape(1, -1))
+
+    vec1_scaled = scaler.transform(vec1.reshape(1, -1))
+    vec2_scaled = scaler.transform(vec2.reshape(1, -1))
+
+    z1 = pca.transform(vec1_scaled)
+    z2 = pca.transform(vec2_scaled)
 
     cos_sim = float(cosine_similarity(z1, z2)[0][0])
     euc_dist = float(euclidean_distances(z1, z2)[0][0])
-    euc_sim = max(0, 1.0 - min(euc_dist / 30.0, 1.0))
+
+    dist_scale = model.get("dist_scale", 30.0)
+    euc_sim = max(0.0, 1.0 - min(euc_dist / dist_scale, 1.0))
     combined = cos_sim * 0.6 + euc_sim * 0.4
 
     if combined >= 0.85:
