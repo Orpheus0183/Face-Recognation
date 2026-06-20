@@ -138,27 +138,51 @@ def create_synthetic_dataset(n_persons=5, n_images=8, log_fn=None):
 # DATASET DARI ZIP UPLOAD
 # ─────────────────────────────────────────────
 
-def detect_zip_structure(extract_dir: str) -> str:
+def unwrap_single_folder(extract_dir: str) -> str:
     """
-    Deteksi struktur dataset di dalam folder hasil ekstrak ZIP.
+    Tembus folder pembungkus tunggal secara rekursif.
+    Contoh: ZIP berisi 'Extracted/Andi/foto.jpg', 'Extracted/Budi/foto.jpg'
+    -> root sebenarnya untuk dataset adalah 'Extracted/', bukan extract_dir itu sendiri.
+
+    Berhenti begitu root punya >1 item, atau item-nya bukan folder tunggal lagi,
+    atau root sudah berisi campuran folder+gambar (berarti sudah level orang).
+    """
+    current = extract_dir
+    while True:
+        items = [
+            i for i in os.listdir(current)
+            if not i.startswith(".") and i != "__MACOSX"
+        ]
+        if len(items) != 1:
+            break
+        only_item = os.path.join(current, items[0])
+        if not os.path.isdir(only_item):
+            break
+        current = only_item
+    return current
+
+
+def detect_zip_structure(root_dir: str) -> str:
+    """
+    Deteksi struktur dataset di dalam root_dir (setelah folder pembungkus ditembus).
     Return 'folder' jika gambar tersusun dalam subfolder per orang,
     atau 'flat' jika semua gambar rata di root (atau campur tanpa subfolder konsisten).
     """
-    root_items = os.listdir(extract_dir)
+    root_items = os.listdir(root_dir)
     # Lewati folder sampah macOS / hidden
     root_items = [i for i in root_items if not i.startswith(".") and i != "__MACOSX"]
 
-    subfolders = [i for i in root_items if os.path.isdir(os.path.join(extract_dir, i))]
+    subfolders = [i for i in root_items if os.path.isdir(os.path.join(root_dir, i))]
     root_images = [
         i for i in root_items
-        if os.path.isfile(os.path.join(extract_dir, i))
+        if os.path.isfile(os.path.join(root_dir, i))
         and os.path.splitext(i)[1].lower() in ALLOWED_EXT
     ]
 
     # Jika ada subfolder dan masing-masing berisi gambar -> struktur folder per orang
     if len(subfolders) >= 1:
         for sub in subfolders:
-            sub_path = os.path.join(extract_dir, sub)
+            sub_path = os.path.join(root_dir, sub)
             has_image = any(
                 os.path.splitext(f)[1].lower() in ALLOWED_EXT
                 for f in os.listdir(sub_path)
@@ -197,7 +221,14 @@ def load_dataset_from_zip(zip_bytes: bytes, log_fn=None):
         with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as zf:
             zf.extractall(extract_dir)
 
-        structure = detect_zip_structure(extract_dir)
+        # Tembus folder pembungkus tunggal, mis. "Extracted/" yang isinya
+        # langsung folder-per-orang, supaya tidak salah dianggap "1 orang".
+        root_dir = unwrap_single_folder(extract_dir)
+        if log_fn and root_dir != extract_dir:
+            wrapper_name = os.path.relpath(root_dir, extract_dir)
+            log_fn(f"  Folder pembungkus terdeteksi & dilewati: {wrapper_name}/")
+
+        structure = detect_zip_structure(root_dir)
         if log_fn:
             mode_label = "Folder per orang" if structure == "folder" else "File rata (flat)"
             log_fn(f"  Struktur terdeteksi: {mode_label}")
@@ -206,18 +237,18 @@ def load_dataset_from_zip(zip_bytes: bytes, log_fn=None):
         skipped = 0
 
         if structure == "folder":
-            # Setiap subfolder langsung di bawah extract_dir = satu orang.
+            # Setiap subfolder langsung di bawah root_dir = satu orang.
             # Gambar di dalamnya (termasuk nested) semua dianggap milik orang itu.
-            root_items = sorted(os.listdir(extract_dir))
+            root_items = sorted(os.listdir(root_dir))
             person_folders = [
                 i for i in root_items
-                if os.path.isdir(os.path.join(extract_dir, i))
+                if os.path.isdir(os.path.join(root_dir, i))
                 and not i.startswith(".") and i != "__MACOSX"
             ]
 
             for person_name in person_folders:
                 label = person_name.strip().lower().replace(" ", "_")
-                person_path = os.path.join(extract_dir, person_name)
+                person_path = os.path.join(root_dir, person_name)
 
                 for root, _, files in os.walk(person_path):
                     for fname in sorted(files):
@@ -240,7 +271,7 @@ def load_dataset_from_zip(zip_bytes: bytes, log_fn=None):
                         labels.append(label)
 
         else:  # flat
-            for root, _, files in os.walk(extract_dir):
+            for root, _, files in os.walk(root_dir):
                 for fname in sorted(files):
                     ext = os.path.splitext(fname)[1].lower()
                     if ext not in ALLOWED_EXT:
