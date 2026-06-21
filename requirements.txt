@@ -1,10 +1,9 @@
 streamlit
-opencv-python-headless
-numpy
-scikit-learn
-pillow
-py7zr
-requests
-mediapipe==0.10.13
-scikit-image
- 
+   opencv-python-headless
+   numpy
+   scikit-learn
+   pillow
+   py7zr
+   requests
+   mediapipe==0.10.13
+   scikit-image
