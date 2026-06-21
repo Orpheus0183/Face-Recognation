@@ -28,19 +28,17 @@ import streamlit as st
 import cv2
 import numpy as np
 import requests
-import mediapipe as mp
+try:
+    import mediapipe as mp
+    MEDIAPIPE_AVAILABLE = True
+except Exception:
+    MEDIAPIPE_AVAILABLE = False
 from skimage.metrics import structural_similarity
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics.pairwise import cosine_similarity, euclidean_distances
 from PIL import Image
 import io, os, re, time, zipfile, tempfile, shutil
-
-try:
-    import py7zr
-    PY7ZR_AVAILABLE = True
-except ImportError:
-    PY7ZR_AVAILABLE = False
 
 # ── Konfigurasi ──────────────────────────────
 IMG_SIZE       = (80, 80)     # disesuaikan dgn resolusi sumber foto publik figur (~50-60px asli)
@@ -100,6 +98,8 @@ def get_face_mesh():
     static_image_mode=True karena tiap pemanggilan adalah gambar independen
     (bukan video stream), supaya deteksi tidak mengandalkan frame sebelumnya.
     """
+    if not MEDIAPIPE_AVAILABLE:
+        return None
     mp_face_mesh = mp.solutions.face_mesh
     return mp_face_mesh.FaceMesh(
         static_image_mode=True,
@@ -126,6 +126,8 @@ def get_mediapipe_eye_centers(img_bgr: np.ndarray):
     tidak terdeteksi sama sekali (foto akan fallback ke metode Haar Cascade).
     """
     face_mesh = get_face_mesh()
+    if face_mesh is None:
+        return None
     h, w = img_bgr.shape[:2]
     rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     results = face_mesh.process(rgb)
