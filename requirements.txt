@@ -4,3 +4,4 @@ numpy
 scikit-learn
 pillow
 py7zr
+requests
