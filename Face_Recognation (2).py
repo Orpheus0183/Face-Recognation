@@ -28,6 +28,8 @@ import streamlit as st
 import cv2
 import numpy as np
 import requests
+import mediapipe as mp
+from skimage.metrics import structural_similarity
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics.pairwise import cosine_similarity, euclidean_distances
@@ -50,6 +52,23 @@ LBP_RADIUS     = 2
 LBP_N_POINTS   = 8 * LBP_RADIUS
 LBP_GRID       = (6, 6)       # grid lebih kecil krn IMG_SIZE juga lebih kecil (80x80)
 
+# Parameter Modular PCA (Gottumukkal & Asari, 2004) -> PCA terpisah per
+# sub-region wajah, supaya variasi lokal (ekspresi) tidak mendistorsi
+# representasi area lain yang stabil (mata, hidung).
+N_COMPONENTS_PER_MODULE = 12   # komponen PCA per modul (modul lebih kecil dari wajah utuh)
+N_COMPONENTS_LBP        = 30   # komponen PCA untuk fitur LBP global
+N_COMPONENTS_HOG        = 30   # komponen PCA untuk fitur HOG global
+
+# Eigenface discarding (Turk & Pentland, 1991; Wikipedia "Eigenface") ->
+# beberapa komponen PCA pertama biasanya didominasi variasi pencahayaan
+# global, bukan informasi identitas wajah, sehingga literatur klasik
+# menyarankan membuangnya. Diuji coba empiris pada dataset ini (lihat log
+# eksperimen): discard=0 memberi skor similarity tertinggi dibanding
+# discard=1/2/3, kemungkinan karena foto sumber sudah melalui CLAHE
+# (equalization) sehingga variasi pencahayaan sudah banyak terkompensasi
+# di awal -- membuang komponen tambahan justru membuang informasi identitas.
+N_EIGENFACE_DISCARD = 0
+
 st.set_page_config(
     page_title="Face Match ML",
     page_icon="🧠",
@@ -58,21 +77,40 @@ st.set_page_config(
 
 
 # ─────────────────────────────────────────────
-# PREPROCESSING — FACE ALIGNMENT
+# PREPROCESSING — FACE ALIGNMENT (mediapipe Face Mesh + fallback Haar Cascade)
 # ─────────────────────────────────────────────
+
+# Index landmark mediapipe Face Mesh (468 titik) untuk pusat tiap mata.
+# Dipilih titik di tengah kelopak mata (lebih stabil dari sekadar sudut mata).
+MP_LEFT_EYE_IDX  = 33    # mata kiri (dari sudut pandang subjek di foto)
+MP_RIGHT_EYE_IDX = 263   # mata kanan
+
 
 @st.cache_resource(show_spinner=False)
 def get_face_cascade():
+    """Fallback kalau mediapipe gagal mendeteksi wajah sama sekali."""
     return cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
 
 
 @st.cache_resource(show_spinner=False)
-def get_eye_cascade():
-    return cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_eye.xml")
+def get_face_mesh():
+    """
+    mediapipe Face Mesh: 468 titik landmark wajah, jauh lebih presisi
+    dibanding Haar Cascade untuk alignment (terutama di foto kecil/miring).
+    static_image_mode=True karena tiap pemanggilan adalah gambar independen
+    (bukan video stream), supaya deteksi tidak mengandalkan frame sebelumnya.
+    """
+    mp_face_mesh = mp.solutions.face_mesh
+    return mp_face_mesh.FaceMesh(
+        static_image_mode=True,
+        max_num_faces=1,
+        refine_landmarks=False,
+        min_detection_confidence=0.3,
+    )
 
 
 def detect_face_box(gray: np.ndarray):
-    """Cari kotak wajah terbesar. Return (x,y,w,h) atau None."""
+    """Fallback: cari kotak wajah pakai Haar Cascade. Return (x,y,w,h) atau None."""
     cascade = get_face_cascade()
     faces = cascade.detectMultiScale(gray, 1.1, 4, minSize=(30, 30))
     if len(faces) == 0:
@@ -81,49 +119,66 @@ def detect_face_box(gray: np.ndarray):
     return faces[0]
 
 
-def align_face(gray: np.ndarray, face_box) -> np.ndarray:
+def get_mediapipe_eye_centers(img_bgr: np.ndarray):
     """
-    Luruskan wajah berdasarkan posisi dua mata, supaya foto dengan kepala
-    miring/beda sudut bisa dibandingkan secara piksel-sejajar dengan foto frontal.
-    Kalau mata tidak terdeteksi, kembalikan crop wajah apa adanya (fallback).
+    Deteksi 468 landmark wajah via mediapipe, lalu kembalikan titik tengah
+    mata kiri & kanan dalam koordinat piksel (x, y). Return None kalau wajah
+    tidak terdeteksi sama sekali (foto akan fallback ke metode Haar Cascade).
     """
-    x, y, w, h = face_box
-    face_roi = gray[y:y + h, x:x + w]
+    face_mesh = get_face_mesh()
+    h, w = img_bgr.shape[:2]
+    rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    results = face_mesh.process(rgb)
 
-    eye_cascade = get_eye_cascade()
-    eyes = eye_cascade.detectMultiScale(face_roi, 1.1, 5, minSize=(int(w*0.12), int(h*0.12)))
+    if not results.multi_face_landmarks:
+        return None
 
-    if len(eyes) < 2:
-        return face_roi  # fallback: tanpa alignment
+    landmarks = results.multi_face_landmarks[0].landmark
+    left_eye = landmarks[MP_LEFT_EYE_IDX]
+    right_eye = landmarks[MP_RIGHT_EYE_IDX]
 
-    # Ambil 2 mata terbesar, urutkan kiri-kanan
-    eyes = sorted(eyes, key=lambda e: e[2] * e[3], reverse=True)[:2]
-    eyes = sorted(eyes, key=lambda e: e[0])
-    (ex1, ey1, ew1, eh1), (ex2, ey2, ew2, eh2) = eyes
+    left_pt = (left_eye.x * w, left_eye.y * h)
+    right_pt = (right_eye.x * w, right_eye.y * h)
+    return left_pt, right_pt
 
-    # Titik tengah tiap mata (koordinat relatif terhadap face_roi)
-    left_eye  = (ex1 + ew1 // 2, ey1 + eh1 // 2)
-    right_eye = (ex2 + ew2 // 2, ey2 + eh2 // 2)
 
-    dx = right_eye[0] - left_eye[0]
-    dy = right_eye[1] - left_eye[1]
-    if dx == 0:
-        return face_roi
+def align_face_mediapipe(img_bgr: np.ndarray, eye_centers) -> np.ndarray:
+    """
+    Luruskan wajah berdasarkan posisi 2 mata hasil mediapipe (jauh lebih
+    presisi dari deteksi mata via Haar Cascade), lalu crop area wajah
+    dengan margin proporsional terhadap jarak antar-mata.
+    """
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    left_pt, right_pt = eye_centers
+
+    dx = right_pt[0] - left_pt[0]
+    dy = right_pt[1] - left_pt[1]
+    if dx == 0 and dy == 0:
+        return gray  # titik mata identik -> tidak bisa hitung sudut, fallback apa adanya
+
     angle = np.degrees(np.arctan2(dy, dx))
+    eye_center = (float((left_pt[0] + right_pt[0]) / 2), float((left_pt[1] + right_pt[1]) / 2))
+    eye_dist = float(np.hypot(dx, dy))
 
-    # Rotasi seluruh gambar grayscale di sekitar pusat wajah, lalu crop ulang
-    center = (float(x + w // 2), float(y + h // 2))
-    rot_mat = cv2.getRotationMatrix2D(center, float(angle), 1.0)
-    rotated = cv2.warpAffine(gray, rot_mat, (gray.shape[1], gray.shape[0]),
-                              flags=cv2.INTER_LINEAR)
+    rot_mat = cv2.getRotationMatrix2D(eye_center, float(angle), 1.0)
+    rotated = cv2.warpAffine(gray, rot_mat, (gray.shape[1], gray.shape[0]), flags=cv2.INTER_LINEAR)
 
-    # Deteksi ulang wajah pada gambar yang sudah diluruskan (lebih akurat)
-    aligned_box = detect_face_box(rotated)
-    if aligned_box is not None:
-        ax, ay, aw, ah = aligned_box
-        return rotated[ay:ay + ah, ax:ax + aw]
+    # Crop area wajah di sekitar mata yang sudah diluruskan. Margin
+    # proporsional terhadap jarak antar-mata (rasio umum untuk crop wajah).
+    half_w = eye_dist * 1.6
+    top = eye_center[1] - eye_dist * 1.1
+    bottom = eye_center[1] + eye_dist * 1.8
+    left = eye_center[0] - half_w
+    right = eye_center[0] + half_w
 
-    return rotated[y:y + h, x:x + w]
+    h, w = rotated.shape
+    x1, y1 = max(0, int(left)), max(0, int(top))
+    x2, y2 = min(w, int(right)), min(h, int(bottom))
+
+    if x2 <= x1 or y2 <= y1:
+        return rotated  # crop tidak valid (foto terlalu kecil/aneh) -> fallback gambar diluruskan utuh
+
+    return rotated[y1:y2, x1:x2]
 
 
 def normalize_lighting(gray: np.ndarray) -> np.ndarray:
@@ -134,15 +189,29 @@ def normalize_lighting(gray: np.ndarray) -> np.ndarray:
 
 def get_aligned_face(img: np.ndarray, use_face_detection=True) -> np.ndarray:
     """
-    Pipeline lengkap: grayscale -> deteksi wajah -> alignment (mata) ->
-    equalization -> resize ke IMG_SIZE. Return grayscale 2D array (bukan flatten).
-    """
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    Pipeline lengkap: deteksi wajah & alignment, lalu equalization & resize.
 
+    Urutan strategi alignment:
+    1. mediapipe Face Mesh (presisi tinggi, berbasis 468 landmark wajah)
+    2. Fallback ke Haar Cascade + estimasi mata sederhana, kalau mediapipe
+       gagal mendeteksi wajah sama sekali (foto sangat buram/gelap/ekstrem)
+    3. Fallback terakhir: cuma resize gambar penuh, kalau kedua metode gagal
+    """
     if use_face_detection:
-        face_box = detect_face_box(gray)
-        if face_box is not None:
-            gray = align_face(gray, face_box)
+        eye_centers = get_mediapipe_eye_centers(img)
+        if eye_centers is not None:
+            gray = align_face_mediapipe(img, eye_centers)
+        else:
+            # Fallback ke Haar Cascade kalau mediapipe tidak menemukan wajah
+            gray_full = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            face_box = detect_face_box(gray_full)
+            if face_box is not None:
+                x, y, w, h = face_box
+                gray = gray_full[y:y + h, x:x + w]
+            else:
+                gray = gray_full
+    else:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
     gray = cv2.resize(gray, IMG_SIZE)
     gray = normalize_lighting(gray)
@@ -218,19 +287,146 @@ def preprocess_image(img: np.ndarray, use_face_detection=True) -> np.ndarray:
       1. Piksel mentah ternormalisasi (menangkap bentuk/struktur wajah)
       2. Histogram LBP (menangkap tekstur, tahan terhadap variasi cahaya)
     Hasil akhir adalah satu vektor 1D gabungan keduanya.
+
+    Catatan: fungsi ini dipertahankan untuk kompatibilitas pemanggil lama.
+    Untuk Modular PCA, gunakan get_aligned_face() langsung lalu split_into_modules().
     """
     aligned = get_aligned_face(img, use_face_detection=use_face_detection)
 
     pixel_features = aligned.astype(np.float64).flatten() / 255.0
     lbp_features = lbp_histogram_features(aligned)
 
-    # Bobot LBP diperkecil relatif (lebih banyak sel tapi tiap nilai histogram
-    # kecil) supaya tidak mendominasi dimensi vs fitur piksel.
     return np.concatenate([pixel_features, lbp_features])
+
+
+# ─────────────────────────────────────────────
+# MODULAR PCA
+# ─────────────────────────────────────────────
+#
+# Landasan teori: PCA konvensional menerapkan satu transformasi global ke
+# seluruh wajah, sehingga variasi besar pada satu area (mis. mulut saat
+# tersenyum lebar) ikut mendistorsi representasi area lain yang sebenarnya
+# tidak berubah (mis. bentuk hidung, jarak mata). Modular PCA (Gottumukkal &
+# Asari, 2004) membagi wajah jadi beberapa sub-region/modul, lalu menerapkan
+# PCA terpisah pada tiap modul. Fitur lokal yang stabil antar pose/ekspresi
+# (mis. area mata, hidung) tetap berkontribusi penuh ke similarity score,
+# sementara distorsi di satu modul (mis. mulut) tidak "membanjiri" modul lain.
+#
+# Referensi: Gottumukkal, R., & Asari, V. K. (2004). An improved face
+# recognition technique based on modular PCA approach. Pattern Recognition
+# Letters, 25(4), 429-436.
+
+MODULE_GRID = (3, 3)  # wajah dibagi 3x3 = 9 modul/sub-region
+
+
+def split_into_modules(aligned_face: np.ndarray, grid=MODULE_GRID) -> list:
+    """
+    Bagi gambar wajah (2D grayscale, sudah di-align & equalize) jadi
+    grid sub-region. Tiap sub-region akan diberi PCA terpisah.
+    Return list of 1D arrays (tiap elemen = 1 modul, sudah di-flatten).
+    """
+    h, w = aligned_face.shape
+    gh, gw = grid
+    cell_h, cell_w = h // gh, w // gw
+
+    modules = []
+    for i in range(gh):
+        for j in range(gw):
+            cell = aligned_face[i*cell_h:(i+1)*cell_h, j*cell_w:(j+1)*cell_w]
+            modules.append(cell.astype(np.float64).flatten() / 255.0)
+    return modules
+
+
+# ─────────────────────────────────────────────
+# FITUR TAMBAHAN: HOG (bentuk/tepi) & SSIM (struktur piksel)
+# ─────────────────────────────────────────────
+#
+# Landasan teori:
+# - HOG (Histogram of Oriented Gradients; Dalal & Triggs, 2005): menangkap
+#   distribusi arah tepi/kontur lokal pada gambar. Untuk wajah, ini menangkap
+#   bentuk garis wajah (alis, rahang, hidung) secara lebih eksplisit
+#   dibanding piksel mentah atau tekstur LBP, dan relatif tahan terhadap
+#   variasi pencahayaan karena berbasis gradien (selisih), bukan nilai
+#   piksel absolut.
+# - SSIM (Structural Similarity Index; Wang et al., 2004): mengukur
+#   kemiripan struktural dua gambar secara langsung (luminance, contrast,
+#   structure), dipakai luas sebagai metrik kemiripan citra. Berbeda dari
+#   fitur berbasis PCA, SSIM dihitung langsung antara dua gambar yang
+#   dibandingkan -- jadi tidak melalui proses training, melainkan sinyal
+#   tambahan independen di tahap perbandingan akhir.
+
+@st.cache_resource(show_spinner=False)
+def get_hog_descriptor():
+    """HOGDescriptor OpenCV, dikonfigurasi untuk ukuran wajah ter-align (IMG_SIZE)."""
+    win_size = IMG_SIZE
+    block_size = (16, 16)
+    block_stride = (8, 8)
+    cell_size = (8, 8)
+    n_bins = 9
+    return cv2.HOGDescriptor(win_size, block_size, block_stride, cell_size, n_bins)
+
+
+def hog_features(aligned_face: np.ndarray) -> np.ndarray:
+    """Ekstrak fitur HOG dari wajah ter-align (2D grayscale, ukuran IMG_SIZE)."""
+    hog = get_hog_descriptor()
+    face_uint8 = aligned_face.astype(np.uint8)
+    descriptor = hog.compute(face_uint8)
+    return descriptor.flatten().astype(np.float64)
+
+
+def compute_ssim(aligned_face1: np.ndarray, aligned_face2: np.ndarray) -> float:
+    """
+    Hitung SSIM langsung antara dua wajah ter-align. Return skor 0-1
+    (1 = identik secara struktural). Dihitung di tahap compare, bukan
+    lewat PCA, karena SSIM secara definisi adalah perbandingan dua
+    gambar, bukan representasi satu gambar yang bisa di-training.
+    """
+    score = structural_similarity(
+        aligned_face1.astype(np.float64),
+        aligned_face2.astype(np.float64),
+        data_range=255.0,
+    )
+    return float(score)
+
+
+def extract_modular_features(img: np.ndarray, use_face_detection=True):
+    """
+    Pipeline Modular PCA: alignment+equalization -> bagi grid -> tiap modul
+    digabung dengan fitur LBP (tekstur) dan HOG (bentuk/tepi) global sebagai
+    konteks tambahan. Return: (list_modul_piksel, vektor_lbp, vektor_hog,
+    gambar_wajah_teralign_untuk_SSIM)
+    """
+    aligned = get_aligned_face(img, use_face_detection=use_face_detection)
+    modules = split_into_modules(aligned)
+    lbp_feat = lbp_histogram_features(aligned)
+    hog_feat = hog_features(aligned)
+    return modules, lbp_feat, hog_feat, aligned
 
 
 def get_face_crop(img: np.ndarray) -> np.ndarray:
     """Crop wajah (sudah di-align) untuk preview, dikembalikan sebagai BGR berwarna."""
+    eye_centers = get_mediapipe_eye_centers(img)
+
+    if eye_centers is not None:
+        left_pt, right_pt = eye_centers
+        eye_center = (float((left_pt[0] + right_pt[0]) / 2), float((left_pt[1] + right_pt[1]) / 2))
+        eye_dist = float(np.hypot(right_pt[0] - left_pt[0], right_pt[1] - left_pt[1]))
+
+        half_w = eye_dist * 1.6
+        top = eye_center[1] - eye_dist * 1.1
+        bottom = eye_center[1] + eye_dist * 1.8
+        left = eye_center[0] - half_w
+        right = eye_center[0] + half_w
+
+        h, w = img.shape[:2]
+        x1, y1 = max(0, int(left)), max(0, int(top))
+        x2, y2 = min(w, int(right)), min(h, int(bottom))
+
+        if x2 > x1 and y2 > y1:
+            crop = img[y1:y2, x1:x2]
+            return cv2.resize(crop, (200, 200))
+
+    # Fallback: Haar Cascade
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     face_box = detect_face_box(gray)
 
@@ -271,9 +467,13 @@ def extract_label_from_filename(filename: str) -> str:
 # ─────────────────────────────────────────────
 
 def create_synthetic_dataset(n_persons=5, n_images=8, log_fn=None):
-    """Buat dataset sintetis: setiap orang punya 'wajah dasar' unik + variasi noise."""
+    """
+    Buat dataset sintetis: setiap orang punya 'wajah dasar' unik + variasi noise.
+    Output disusun dalam format modular (sama seperti load_dataset_from_archive)
+    supaya kompatibel langsung dengan run_training() versi Modular PCA.
+    """
     if log_fn: log_fn("Membuat dataset sintetis...")
-    X, labels = [], []
+    all_modules, all_lbp, all_hog, labels = [], [], [], []
     names = [f"orang_{i+1}" for i in range(n_persons)]
 
     for name in names:
@@ -289,13 +489,29 @@ def create_synthetic_dataset(n_persons=5, n_images=8, log_fn=None):
 
         for j in range(n_images):
             noise = rng.integers(-25, 26, IMG_SIZE).astype(np.float64)
-            face = np.clip(base_face + noise, 0, 255) / 255.0
-            X.append(face.flatten())
+            face = np.clip(base_face + noise, 0, 255)  # masih 0-255, belum dinormalisasi
+
+            modules = split_into_modules(face)
+            lbp = lbp_histogram_features(face.astype(np.uint8))
+            hog = hog_features(face)
+
+            all_modules.append(modules)
+            all_lbp.append(lbp)
+            all_hog.append(hog)
             labels.append(name)
 
         if log_fn: log_fn(f"  ✓ {name}: {n_images} gambar dibuat")
 
-    return np.array(X), np.array(labels)
+    n_modules = len(all_modules[0])
+    modules_by_position = [
+        np.array([photo_modules[m] for photo_modules in all_modules], dtype=np.float64)
+        for m in range(n_modules)
+    ]
+    lbp_arr = np.array(all_lbp, dtype=np.float64)
+    hog_arr = np.array(all_hog, dtype=np.float64)
+    labels_arr = np.array(labels)
+
+    return modules_by_position, lbp_arr, hog_arr, labels_arr
 
 
 # ─────────────────────────────────────────────
@@ -461,9 +677,12 @@ def load_dataset_from_archive(archive_bytes: bytes, filename: str, log_fn=None, 
         if log_fn:
             log_fn(f"  {total_files} file gambar ditemukan, memproses satu per satu...")
 
-        # Proses satu per satu: baca -> ekstrak fitur -> buang gambar mentahnya
-        # segera (img dan vec sementara, tidak ada penumpukan array besar).
-        X, labels = [], []
+        # Proses satu per satu: baca -> ekstrak fitur modular -> buang gambar
+        # mentahnya segera (img dan vec sementara, tidak ada penumpukan array besar).
+        # Catatan: gambar 'aligned' dari extract_modular_features TIDAK disimpan
+        # di sini (cuma dipakai untuk SSIM saat compare 2 foto, bukan saat training
+        # banyak foto sekaligus -- supaya tidak boros memori untuk dataset besar).
+        all_modules, all_lbp, all_hog, labels = [], [], [], []
         skipped = 0
         report_every = max(1, total_files // 10)  # update progress tiap ~10%
 
@@ -473,14 +692,16 @@ def load_dataset_from_archive(archive_bytes: bytes, filename: str, log_fn=None, 
                 skipped += 1
                 continue
             try:
-                vec = preprocess_image(img, use_face_detection=True)
+                modules, lbp, hog, _aligned = extract_modular_features(img, use_face_detection=True)
             except Exception:
                 skipped += 1
                 continue
             finally:
                 del img  # lepas gambar mentah dari memori segera setelah dipakai
 
-            X.append(vec)
+            all_modules.append(modules)
+            all_lbp.append(lbp)
+            all_hog.append(hog)
             labels.append(label)
 
             if progress_fn and (idx + 1) % report_every == 0:
@@ -491,7 +712,7 @@ def load_dataset_from_archive(archive_bytes: bytes, filename: str, log_fn=None, 
         if progress_fn:
             progress_fn(total_files, total_files)
 
-        if len(X) == 0:
+        if len(all_modules) == 0:
             raise ValueError(
                 "Tidak ada gambar valid ditemukan di dalam arsip. "
                 "Pastikan struktur folder per orang (nama_orang/foto.jpg) "
@@ -500,20 +721,29 @@ def load_dataset_from_archive(archive_bytes: bytes, filename: str, log_fn=None, 
 
         unique_labels = sorted(set(labels))
         if log_fn:
-            log_fn(f"  ✓ {len(X)} gambar berhasil dibaca, {len(unique_labels)} orang terdeteksi")
+            log_fn(f"  ✓ {len(all_modules)} gambar berhasil dibaca, {len(unique_labels)} orang terdeteksi")
             if skipped > 0:
                 log_fn(f"  ⚠ {skipped} file dilewati (gagal dibaca / wajah tidak terdeteksi)")
             for lbl in unique_labels:
                 count = labels.count(lbl)
                 log_fn(f"    - {lbl}: {count} foto")
 
-        X_arr = np.array(X, dtype=np.float64)
+        # Susun ulang per-modul: dari list (per foto) of list (per modul)
+        # menjadi list (per modul) of array (per foto) -> bentuk yang
+        # dibutuhkan untuk melatih satu PCA per modul di run_training().
+        n_modules = len(all_modules[0])
+        modules_by_position = [
+            np.array([photo_modules[m] for photo_modules in all_modules], dtype=np.float64)
+            for m in range(n_modules)
+        ]
+        lbp_arr = np.array(all_lbp, dtype=np.float64)
+        hog_arr = np.array(all_hog, dtype=np.float64)
         labels_arr = np.array(labels)
-        # Lepas list Python setelah dikonversi -> hindari dua salinan data sekaligus
-        del X, labels
+
+        del all_modules, all_lbp, all_hog, labels
         gc.collect()
 
-        return X_arr, labels_arr
+        return modules_by_position, lbp_arr, hog_arr, labels_arr
 
     finally:
         shutil.rmtree(extract_dir, ignore_errors=True)
@@ -523,47 +753,102 @@ def load_dataset_from_archive(archive_bytes: bytes, filename: str, log_fn=None, 
 # TRAINING PCA
 # ─────────────────────────────────────────────
 
-def run_training(X: np.ndarray, labels: np.ndarray, log_fn=None):
+def run_training(modules_by_position, lbp_arr: np.ndarray, hog_arr: np.ndarray,
+                  labels: np.ndarray, log_fn=None):
+    """
+    Training Modular PCA: satu PCA terpisah dilatih untuk tiap modul/sub-region
+    wajah (mis. 9 modul untuk grid 3x3), plus satu PCA untuk fitur LBP global
+    (tekstur) dan satu PCA untuk fitur HOG global (bentuk/tepi).
+
+    Landasan teori (Gottumukkal & Asari, 2004): membagi wajah jadi sub-region
+    membuat variasi lokal (ekspresi di area mulut, dsb.) tidak mendistorsi
+    representasi area lain yang stabil (mata, hidung). Setiap modul berkontribusi
+    independen ke skor similarity akhir.
+
+    Eigenface discarding (Turk & Pentland, 1991 // dianjurkan literatur lanjutan):
+    komponen utama pertama dari PCA wajah biasanya didominasi oleh variasi
+    pencahayaan global, bukan informasi identitas. N_EIGENFACE_DISCARD komponen
+    pertama dari tiap PCA modul dibuang sebelum dipakai untuk similarity.
+
+    HOG (Dalal & Triggs, 2005): fitur gradien tepi/kontur, menangkap bentuk
+    wajah secara eksplisit, dilatih sebagai PCA terpisah seperti LBP.
+    """
     n_unique = len(np.unique(labels))
     if n_unique < 2:
         raise ValueError("Minimal perlu 2 orang berbeda dalam dataset untuk training")
-    if X.shape[0] < 3:
+    if len(labels) < 3:
         raise ValueError("Minimal perlu 3 foto total dalam dataset untuk training")
 
-    if log_fn: log_fn(f"\nDataset: {X.shape[0]} gambar | {n_unique} orang | dimensi {X.shape[1]}")
+    n_samples = len(labels)
+    n_modules = len(modules_by_position)
+    if log_fn:
+        log_fn(f"\nDataset: {n_samples} gambar | {n_unique} orang")
+        log_fn(f"Modular PCA: wajah dibagi {MODULE_GRID[0]}x{MODULE_GRID[1]} = {n_modules} modul")
 
-    # Standardisasi fitur sebelum PCA. Penting karena fitur gabungan piksel + LBP
-    # punya skala berbeda -> tanpa ini PCA bisa bias ke salah satu jenis fitur.
-    if log_fn: log_fn("\nStandardisasi fitur (piksel + LBP)...")
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-
-    n_comp = min(N_COMPONENTS, X.shape[0] - 1, X.shape[1])
-    if log_fn: log_fn(f"\nTraining PCA dengan {n_comp} komponen...")
-
-    # svd_solver="randomized" jauh lebih cepat & hemat memori dibanding "full"
-    # untuk kasus kita (ambil sebagian kecil komponen dari dimensi besar).
-    # Di uji coba lokal: ~13s (full) -> ~2.4s (randomized) untuk data sejenis.
-    # "full" menghitung SVD lengkap dari seluruh matriks meski cuma butuh
-    # n_comp komponen pertama -- sangat boros di server dengan CPU/RAM terbatas
-    # seperti Streamlit Community Cloud free tier.
     t_start = time.time()
-    pca = PCA(n_components=n_comp, svd_solver="randomized", random_state=42)
-    X_pca = pca.fit_transform(X_scaled)
+
+    # Komponen per modul disesuaikan dengan ukuran modul itu sendiri & jumlah
+    # sampel, supaya tidak minta lebih komponen daripada yang tersedia.
+    module_pcas = []
+    module_scalers = []
+    X_pca_modules = []
+
+    for m_idx, X_module in enumerate(modules_by_position):
+        scaler_m = StandardScaler()
+        X_module_scaled = scaler_m.fit_transform(X_module)
+
+        max_comp = min(N_COMPONENTS_PER_MODULE, n_samples - 1, X_module.shape[1])
+        # Sisakan ruang untuk discard eigenface pertama -- minimal 1 komponen tersisa
+        max_comp = max(max_comp, N_EIGENFACE_DISCARD + 1)
+
+        pca_m = PCA(n_components=max_comp, svd_solver="randomized", random_state=42)
+        Z_m = pca_m.fit_transform(X_module_scaled)
+
+        module_pcas.append(pca_m)
+        module_scalers.append(scaler_m)
+        X_pca_modules.append(Z_m)
+
+    # PCA terpisah untuk fitur LBP global (tekstur, tahan-cahaya)
+    lbp_scaler = StandardScaler()
+    lbp_scaled = lbp_scaler.fit_transform(lbp_arr)
+    lbp_n_comp = min(N_COMPONENTS_LBP, n_samples - 1, lbp_arr.shape[1])
+    lbp_pca = PCA(n_components=lbp_n_comp, svd_solver="randomized", random_state=42)
+    X_pca_lbp = lbp_pca.fit_transform(lbp_scaled)
+
+    # PCA terpisah untuk fitur HOG global (bentuk/tepi)
+    hog_scaler = StandardScaler()
+    hog_scaled = hog_scaler.fit_transform(hog_arr)
+    hog_n_comp = min(N_COMPONENTS_HOG, n_samples - 1, hog_arr.shape[1])
+    hog_pca = PCA(n_components=hog_n_comp, svd_solver="randomized", random_state=42)
+    X_pca_hog = hog_pca.fit_transform(hog_scaled)
+
     t_elapsed = time.time() - t_start
 
-    explained = float(np.sum(pca.explained_variance_ratio_)) * 100
-    if log_fn:
-        log_fn(f"  ✓ PCA selesai dalam {t_elapsed:.1f} detik")
-        log_fn(f"  ✓ Explained variance: {explained:.1f}%")
-        log_fn(f"  ✓ Dimensi PCA: {X_pca.shape}")
+    avg_explained = float(np.mean([
+        np.sum(p.explained_variance_ratio_) for p in module_pcas
+    ])) * 100
 
-    # Kalibrasi skala jarak euclidean dari data training itu sendiri, supaya
-    # threshold "mirip" tidak pakai angka tetap yang sensitif terhadap
-    # perubahan jumlah komponen / jenis fitur.
-    sample_n = min(300, X_pca.shape[0])
-    idx = np.random.default_rng(42).choice(X_pca.shape[0], size=sample_n, replace=False)
-    sample_dists = euclidean_distances(X_pca[idx])
+    if log_fn:
+        log_fn(f"  ✓ {n_modules} PCA modul + PCA LBP + PCA HOG selesai dalam {t_elapsed:.1f} detik")
+        log_fn(f"  ✓ {N_EIGENFACE_DISCARD} eigenface pertama tiap modul dibuang (dominasi pencahayaan)")
+        log_fn(f"  ✓ Rata-rata explained variance per modul: {avg_explained:.1f}%")
+
+    # Kalibrasi skala jarak euclidean gabungan dari data training itu sendiri.
+    # Pakai representasi gabungan semua modul (setelah discard) + LBP + HOG
+    # untuk estimasi skala yang representatif terhadap skor compare_faces().
+    sample_n = min(300, n_samples)
+    rng = np.random.default_rng(42)
+    idx_sample = rng.choice(n_samples, size=sample_n, replace=False)
+
+    combined_train_vectors = []
+    for i in idx_sample:
+        parts = [Z[i, N_EIGENFACE_DISCARD:] for Z in X_pca_modules]
+        parts.append(X_pca_lbp[i])
+        parts.append(X_pca_hog[i])
+        combined_train_vectors.append(np.concatenate(parts))
+    combined_train_vectors = np.array(combined_train_vectors)
+
+    sample_dists = euclidean_distances(combined_train_vectors)
     upper_tri = sample_dists[np.triu_indices(sample_n, k=1)]
     dist_scale = float(np.percentile(upper_tri, 90)) if len(upper_tri) > 0 else 30.0
     dist_scale = max(dist_scale, 1e-6)
@@ -573,46 +858,93 @@ def run_training(X: np.ndarray, labels: np.ndarray, log_fn=None):
         log_fn(f"\n✅ Model berhasil ditraining! Siap membandingkan wajah.")
 
     return {
-        "pca": pca,
-        "scaler": scaler,
-        "X_pca": X_pca,
+        "module_pcas": module_pcas,
+        "module_scalers": module_scalers,
+        "lbp_pca": lbp_pca,
+        "lbp_scaler": lbp_scaler,
+        "hog_pca": hog_pca,
+        "hog_scaler": hog_scaler,
         "labels": labels,
         "dist_scale": dist_scale,
+        "n_modules": n_modules,
     }
 
 
-def compare_faces(model: dict, img1: np.ndarray, img2: np.ndarray) -> dict:
-    vec1 = preprocess_image(img1)
-    vec2 = preprocess_image(img2)
+def project_image_to_model(model: dict, img: np.ndarray):
+    """
+    Proyeksikan satu gambar ke ruang Modular PCA model: ekstrak modul + LBP
+    + HOG, transform tiap modul dengan PCA-nya masing-masing (buang
+    N_EIGENFACE_DISCARD komponen pertama), gabung jadi satu vektor representasi
+    akhir. Juga mengembalikan gambar wajah ter-align (dibutuhkan untuk SSIM,
+    yang dihitung langsung di compare_faces, bukan lewat PCA).
+    """
+    modules, lbp, hog, aligned = extract_modular_features(img)
 
-    scaler = model["scaler"]
-    pca = model["pca"]
+    parts = []
+    for m_idx, module_vec in enumerate(modules):
+        scaler_m = model["module_scalers"][m_idx]
+        pca_m = model["module_pcas"][m_idx]
+        scaled = scaler_m.transform(module_vec.reshape(1, -1))
+        projected = pca_m.transform(scaled)[0]
+        parts.append(projected[N_EIGENFACE_DISCARD:])
 
-    vec1_scaled = scaler.transform(vec1.reshape(1, -1))
-    vec2_scaled = scaler.transform(vec2.reshape(1, -1))
+    lbp_scaled = model["lbp_scaler"].transform(lbp.reshape(1, -1))
+    lbp_projected = model["lbp_pca"].transform(lbp_scaled)[0]
+    parts.append(lbp_projected)
 
-    z1 = pca.transform(vec1_scaled)
-    z2 = pca.transform(vec2_scaled)
+    hog_scaled = model["hog_scaler"].transform(hog.reshape(1, -1))
+    hog_projected = model["hog_pca"].transform(hog_scaled)[0]
+    parts.append(hog_projected)
+
+    return np.concatenate(parts), aligned
+
+
+def compare_faces(model: dict, img1: np.ndarray, img2: np.ndarray,
+                   weight_cosine: float = 0.45, weight_euclidean: float = 0.30,
+                   weight_ssim: float = 0.25) -> dict:
+    """
+    Bandingkan dua wajah. Skor akhir adalah weighted sum dari 3 sinyal:
+    - Cosine similarity di ruang Modular PCA (gabungan modul + LBP + HOG)
+    - Euclidean similarity (1 - jarak ternormalisasi) di ruang yang sama
+    - SSIM: kemiripan struktural piksel langsung antara 2 wajah ter-align
+
+    Bobot bisa diatur (weight_cosine, weight_euclidean, weight_ssim) -- akan
+    dinormalisasi otomatis supaya totalnya selalu 1.0 berapapun nilai mentahnya.
+    """
+    z1, aligned1 = project_image_to_model(model, img1)
+    z2, aligned2 = project_image_to_model(model, img2)
+    z1, z2 = z1.reshape(1, -1), z2.reshape(1, -1)
 
     cos_sim = float(cosine_similarity(z1, z2)[0][0])
     euc_dist = float(euclidean_distances(z1, z2)[0][0])
 
     dist_scale = model.get("dist_scale", 30.0)
     euc_sim = max(0.0, 1.0 - min(euc_dist / dist_scale, 1.0))
-    combined = cos_sim * 0.6 + euc_sim * 0.4
 
-    if combined >= 0.85:
-        verdict, sub, level, emoji = "SANGAT MIRIP", "Kemungkinan besar orang yang sama", "high", "✅"
-    elif combined >= 0.70:
+    ssim_sim = compute_ssim(aligned1, aligned2)
+    ssim_sim = max(0.0, ssim_sim)  # SSIM bisa negatif untuk citra sangat berbeda; clamp ke 0
+
+    # Normalisasi bobot supaya totalnya selalu 1.0 (robust terhadap input
+    # sembarang dari slider UI, mis. kalau user set semua ke 0).
+    total_w = weight_cosine + weight_euclidean + weight_ssim
+    if total_w <= 0:
+        weight_cosine, weight_euclidean, weight_ssim = 0.45, 0.30, 0.25
+        total_w = 1.0
+    wc, we, ws = weight_cosine / total_w, weight_euclidean / total_w, weight_ssim / total_w
+
+    combined = cos_sim * wc + euc_sim * we + ssim_sim * ws
+
+    if combined >= 0.50:
+        verdict, sub, level, emoji = "MIRIP", "Kemungkinan besar orang yang sama", "high", "✅"
+    elif combined >= 0.40:
         verdict, sub, level, emoji = "CUKUP MIRIP", "Mungkin orang yang sama", "medium", "🤔"
-    elif combined >= 0.50:
-        verdict, sub, level, emoji = "KURANG MIRIP", "Kemungkinan orang berbeda", "low", "⚠️"
     else:
         verdict, sub, level, emoji = "TIDAK MIRIP", "Kemungkinan besar orang berbeda", "none", "❌"
 
     return {
         "cosine_similarity": round(cos_sim * 100, 1),
         "euclidean_sim": round(euc_sim * 100, 1),
+        "ssim_similarity": round(ssim_sim * 100, 1),
         "combined_score": round(combined * 100, 1),
         "verdict": verdict,
         "verdict_sub": sub,
@@ -714,7 +1046,7 @@ def deserialize_model(data: bytes) -> dict:
     except Exception as e:
         raise ValueError(f"File tidak bisa dibaca sebagai model (.pkl) yang valid: {e}")
 
-    required_keys = {"pca", "scaler", "labels"}
+    required_keys = {"module_pcas", "module_scalers", "lbp_pca", "lbp_scaler", "labels"}
     if not isinstance(model, dict) or not required_keys.issubset(model.keys()):
         raise ValueError(
             "Struktur file tidak sesuai format model aplikasi ini. "
@@ -755,11 +1087,14 @@ with tab_train:
         m = st.session_state.model
         n_persons = len(np.unique(m["labels"]))
         n_samples = len(m["labels"])
-        explained = float(np.sum(m["pca"].explained_variance_ratio_)) * 100
+        avg_explained = float(np.mean([
+            np.sum(p.explained_variance_ratio_) for p in m["module_pcas"]
+        ])) * 100
         st.success(
             f"✅ **Model sudah tertraining!**  \n"
-            f"{n_persons} orang · {n_samples} sampel · {m['pca'].n_components_} komponen PCA · "
-            f"{explained:.1f}% explained variance"
+            f"{n_persons} orang · {n_samples} sampel · {m['n_modules']} modul PCA "
+            f"({MODULE_GRID[0]}x{MODULE_GRID[1]}) + 1 PCA LBP · "
+            f"{avg_explained:.1f}% rata-rata explained variance"
         )
 
         model_bytes = serialize_model(m)
@@ -805,9 +1140,9 @@ with tab_train:
             log_box = st.empty()
             try:
                 with st.spinner("Training berjalan..."):
-                    X, labels = create_synthetic_dataset(n_persons, n_images, log_fn=log)
+                    modules, lbp_arr, hog_arr, labels = create_synthetic_dataset(n_persons, n_images, log_fn=log)
                     log_box.code("\n".join(st.session_state.train_log))
-                    model = run_training(X, labels, log_fn=log)
+                    model = run_training(modules, lbp_arr, hog_arr, labels, log_fn=log)
                     log_box.code("\n".join(st.session_state.train_log))
                 st.session_state.model = model
                 st.rerun()
@@ -846,7 +1181,7 @@ with tab_train:
                     pct = done / total if total > 0 else 0
                     progress_bar.progress(pct, text=f"Memproses foto {done}/{total}...")
 
-                X, labels = load_dataset_from_archive(
+                modules, lbp_arr, hog_arr, labels = load_dataset_from_archive(
                     archive_bytes, archive_file.name,
                     log_fn=log, progress_fn=update_progress,
                 )
@@ -854,7 +1189,7 @@ with tab_train:
                 progress_bar.progress(1.0, text="Memproses foto selesai, melatih PCA...")
 
                 with st.spinner("Training PCA..."):
-                    model = run_training(X, labels, log_fn=log)
+                    model = run_training(modules, lbp_arr, hog_arr, labels, log_fn=log)
                 log_box.code("\n".join(st.session_state.train_log))
 
                 progress_bar.empty()
@@ -977,6 +1312,19 @@ with tab_compare:
             if file2:
                 st.image(file2, use_container_width=True)
 
+        with st.expander("⚙️ Bobot Skor (lanjutan)", expanded=False):
+            st.caption(
+                "Atur kontribusi tiap sinyal similarity ke skor akhir. "
+                "Nilai dinormalisasi otomatis (jumlah tidak harus 1.0)."
+            )
+            wc1, wc2, wc3 = st.columns(3)
+            with wc1:
+                weight_cosine = st.slider("Cosine (Modular PCA)", 0.0, 1.0, 0.45, 0.05)
+            with wc2:
+                weight_euclidean = st.slider("Euclidean (Modular PCA)", 0.0, 1.0, 0.30, 0.05)
+            with wc3:
+                weight_ssim = st.slider("SSIM (Struktur Piksel)", 0.0, 1.0, 0.25, 0.05)
+
         analyze_disabled = not (file1 and file2)
         if st.button("🔎 Analisis Kemiripan", type="primary",
                       use_container_width=True, disabled=analyze_disabled):
@@ -990,7 +1338,12 @@ with tab_compare:
                     crop1 = get_face_crop(img1)
                     crop2 = get_face_crop(img2)
 
-                    result = compare_faces(st.session_state.model, img1, img2)
+                    result = compare_faces(
+                        st.session_state.model, img1, img2,
+                        weight_cosine=weight_cosine,
+                        weight_euclidean=weight_euclidean,
+                        weight_ssim=weight_ssim,
+                    )
 
                 st.markdown("---")
 
@@ -1013,16 +1366,18 @@ with tab_compare:
                 </div>
                 """, unsafe_allow_html=True)
 
-                s1, s2, s3 = st.columns(3)
+                s1, s2, s3, s4 = st.columns(4)
                 s1.metric("Skor Gabungan", f"{result['combined_score']}%")
-                s2.metric("Cosine Similarity", f"{result['cosine_similarity']}%")
-                s3.metric("Euclidean Sim", f"{result['euclidean_sim']}%")
+                s2.metric("Cosine (Modular PCA)", f"{result['cosine_similarity']}%")
+                s3.metric("Euclidean (Modular PCA)", f"{result['euclidean_sim']}%")
+                s4.metric("SSIM (Struktur)", f"{result['ssim_similarity']}%")
 
                 n_persons = len(np.unique(st.session_state.model["labels"]))
                 n_samples = len(st.session_state.model["labels"])
                 st.caption(
-                    f"⚙️ Model: {n_persons} orang, {n_samples} sampel training — PCA/SVD Eigenfaces.  "
-                    f"Skor ≥85% sangat mirip · 70-85% mungkin sama · <70% kemungkinan berbeda."
+                    f"⚙️ Model: {n_persons} orang, {n_samples} sampel training — "
+                    f"Modular PCA + LBP + HOG + SSIM. "
+                    f"Skor ≥50% mirip · 40-49% cukup mirip · <40% tidak mirip."
                 )
 
             except Exception as e:
