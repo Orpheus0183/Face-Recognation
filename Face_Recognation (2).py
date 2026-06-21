@@ -31,7 +31,7 @@ from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics.pairwise import cosine_similarity, euclidean_distances
 from PIL import Image
-import io, os, re, time, zipfile, tempfile, shutil
+import io, os, re, zipfile, tempfile, shutil, gc
 
 try:
     import py7zr
@@ -43,6 +43,12 @@ except ImportError:
 IMG_SIZE       = (80, 80)     # disesuaikan dgn resolusi sumber foto publik figur (~50-60px asli)
 N_COMPONENTS   = 60           # diturunkan sedikit mengikuti dimensi fitur yg juga lebih kecil
 ALLOWED_EXT    = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+FEATURE_DTYPE  = np.float32   # float32 cukup presisi utk PCA & hemat ~50% RAM vs float64
+
+# Batas keamanan supaya tidak OOM di server dgn RAM terbatas (mis. Streamlit Community Cloud ±1GB)
+MAX_ARCHIVE_MB   = 300        # ukuran arsip terkompresi maksimum
+MAX_IMAGES       = 4000       # jumlah foto maksimum yang diproses per training
+GC_EVERY_N_IMGS  = 200        # paksa garbage collection tiap N gambar saat loop besar
 
 # Parameter LBP (Local Binary Pattern) -> fitur tekstur tahan-cahaya
 LBP_RADIUS     = 2
@@ -163,7 +169,7 @@ def compute_lbp(gray: np.ndarray, radius=LBP_RADIUS, n_points=LBP_N_POINTS) -> n
     # n_points bisa sampai 16 (radius=2) -> nilai LBP maksimum 2^16-1,
     # jadi pakai uint32 supaya tidak overflow.
     lbp = np.zeros((h, w), dtype=np.uint32)
-    gray_f = gray.astype(np.float64)
+    gray_f = gray.astype(np.float32)
 
     angles = [2 * np.pi * p / n_points for p in range(n_points)]
     offsets = [(radius * np.cos(a), -radius * np.sin(a)) for a in angles]
@@ -195,7 +201,7 @@ def lbp_histogram_features(gray: np.ndarray, grid=LBP_GRID) -> np.ndarray:
     max_val = 2 ** LBP_N_POINTS
     n_bins = min(max_val, 256)
     # Skala nilai LBP mentah ke rentang [0, n_bins) sebelum histogram
-    lbp_scaled = (lbp.astype(np.float64) / max_val * n_bins).astype(np.int64)
+    lbp_scaled = (lbp.astype(np.float32) / max_val * n_bins).astype(np.int64)
     lbp_scaled = np.clip(lbp_scaled, 0, n_bins - 1)
 
     hist_all = []
@@ -203,7 +209,7 @@ def lbp_histogram_features(gray: np.ndarray, grid=LBP_GRID) -> np.ndarray:
         for j in range(gw):
             cell = lbp_scaled[i*cell_h:(i+1)*cell_h, j*cell_w:(j+1)*cell_w]
             hist, _ = np.histogram(cell.flatten(), bins=n_bins, range=(0, n_bins))
-            hist = hist.astype(np.float64)
+            hist = hist.astype(np.float32)
             hist /= (hist.sum() + 1e-7)  # normalisasi per sel
             hist_all.append(hist)
 
@@ -220,12 +226,12 @@ def preprocess_image(img: np.ndarray, use_face_detection=True) -> np.ndarray:
     """
     aligned = get_aligned_face(img, use_face_detection=use_face_detection)
 
-    pixel_features = aligned.astype(np.float64).flatten() / 255.0
+    pixel_features = aligned.astype(np.float32).flatten() / 255.0
     lbp_features = lbp_histogram_features(aligned)
 
     # Bobot LBP diperkecil relatif (lebih banyak sel tapi tiap nilai histogram
     # kecil) supaya tidak mendominasi dimensi vs fitur piksel.
-    return np.concatenate([pixel_features, lbp_features])
+    return np.concatenate([pixel_features, lbp_features]).astype(np.float32)
 
 
 def get_face_crop(img: np.ndarray) -> np.ndarray:
@@ -366,7 +372,7 @@ def detect_zip_structure(root_dir: str) -> str:
     return "flat"
 
 
-def load_dataset_from_archive(archive_bytes: bytes, filename: str, log_fn=None, progress_fn=None):
+def load_dataset_from_archive(archive_bytes: bytes, filename: str, log_fn=None):
     """
     Ekstrak file arsip (.zip atau .7z, dari bytes di memori), lalu baca dataset
     dengan dua mode yang dideteksi otomatis:
@@ -376,18 +382,18 @@ def load_dataset_from_archive(archive_bytes: bytes, filename: str, log_fn=None, 
 
     2. MODE FLAT    -> arsip/namaorang_nomor.jpg (semua rata, tanpa folder)
        Label diambil dari nama file pakai extract_label_from_filename().
-
-    Dioptimalkan untuk hemat memori (penting di server dgn RAM terbatas
-    spt Streamlit Community Cloud free tier):
-    - archive_bytes dilepas dari RAM begitu selesai diekstrak ke disk
-    - Tiap foto dibaca, diproses jadi vektor fitur, lalu file gambarnya
-      langsung "dilupakan" (tidak ada array gambar mentah yang menumpuk)
-    - Vektor fitur dikumpulkan di list Python biasa (ringan per-elemen)
-      lalu dikonversi ke satu np.array di akhir
     """
     ext = os.path.splitext(filename)[1].lower()
 
-    if log_fn: log_fn(f"Mengekstrak dataset dari {ext.upper().lstrip('.')}...")
+    size_mb = len(archive_bytes) / (1024 * 1024)
+    if size_mb > MAX_ARCHIVE_MB:
+        raise ValueError(
+            f"Ukuran arsip {size_mb:.0f}MB melebihi batas {MAX_ARCHIVE_MB}MB. "
+            f"Server punya RAM terbatas — kalau dataset besar, kecilkan resolusi foto "
+            f"dulu sebelum di-zip, atau pecah jadi beberapa arsip lebih kecil."
+        )
+
+    if log_fn: log_fn(f"Mengekstrak dataset dari {ext.upper().lstrip('.')}... ({size_mb:.1f}MB)")
 
     extract_dir = tempfile.mkdtemp(prefix="faceds_")
     try:
@@ -407,11 +413,9 @@ def load_dataset_from_archive(archive_bytes: bytes, filename: str, log_fn=None, 
         else:
             raise ValueError(f"Format file '{ext}' tidak didukung. Gunakan .zip atau .7z")
 
-        # Lepas bytes arsip mentah dari memori sesegera mungkin -- begitu
-        # sudah diekstrak ke disk, kita tidak butuh salinan di RAM lagi.
-        # Untuk dataset 200MB+, ini langsung membebaskan 200MB+ RAM.
+        # Lepas referensi ke bytes arsip secepatnya -- begitu sudah diekstrak ke
+        # disk kita tidak butuh salinan di RAM ini lagi. Penting utk arsip besar.
         del archive_bytes
-        import gc
         gc.collect()
 
         # Tembus folder pembungkus tunggal, mis. "Extracted/" yang isinya
@@ -426,73 +430,99 @@ def load_dataset_from_archive(archive_bytes: bytes, filename: str, log_fn=None, 
             mode_label = "Folder per orang" if structure == "folder" else "File rata (flat)"
             log_fn(f"  Struktur terdeteksi: {mode_label}")
 
-        # Kumpulkan dulu daftar (filepath, label) tanpa membuka gambarnya --
-        # ini ringan walau jumlah file ribuan, karena cuma teks path.
-        file_label_pairs = []
+        X, labels = [], []
+        skipped = 0
 
         if structure == "folder":
+            # Setiap subfolder langsung di bawah root_dir = satu orang.
+            # Gambar di dalamnya (termasuk nested) semua dianggap milik orang itu.
             root_items = sorted(os.listdir(root_dir))
             person_folders = [
                 i for i in root_items
                 if os.path.isdir(os.path.join(root_dir, i))
                 and not i.startswith(".") and i != "__MACOSX"
             ]
+
             for person_name in person_folders:
                 label = person_name.strip().lower().replace(" ", "_")
                 person_path = os.path.join(root_dir, person_name)
+
                 for root, _, files in os.walk(person_path):
                     for fname in sorted(files):
-                        fext = os.path.splitext(fname)[1].lower()
-                        if fext not in ALLOWED_EXT or fname.startswith("."):
+                        ext = os.path.splitext(fname)[1].lower()
+                        if ext not in ALLOWED_EXT or fname.startswith("."):
                             continue
-                        file_label_pairs.append((os.path.join(root, fname), label))
+
+                        if len(X) >= MAX_IMAGES:
+                            if log_fn and len(X) == MAX_IMAGES:
+                                log_fn(f"  ⚠ Batas {MAX_IMAGES} gambar tercapai, sisanya dilewati "
+                                       f"(supaya server tidak kehabisan RAM)")
+                            skipped += 1
+                            continue
+
+                        fpath = os.path.join(root, fname)
+                        img = cv2.imread(fpath)
+                        if img is None:
+                            skipped += 1
+                            continue
+                        try:
+                            vec = preprocess_image(img, use_face_detection=True)
+                        except Exception:
+                            skipped += 1
+                            continue
+                        finally:
+                            del img
+
+                        X.append(vec)
+                        labels.append(label)
+
+                        if len(X) % GC_EVERY_N_IMGS == 0:
+                            gc.collect()
+                            if log_fn:
+                                log_fn(f"  ... {len(X)} gambar diproses")
 
         else:  # flat
             for root, _, files in os.walk(root_dir):
                 for fname in sorted(files):
-                    fext = os.path.splitext(fname)[1].lower()
-                    if fext not in ALLOWED_EXT or fname.startswith("._") or fname.startswith("."):
+                    ext = os.path.splitext(fname)[1].lower()
+                    if ext not in ALLOWED_EXT:
                         continue
+                    if fname.startswith("._") or fname.startswith("."):
+                        continue
+
+                    if len(X) >= MAX_IMAGES:
+                        if log_fn and len(X) == MAX_IMAGES:
+                            log_fn(f"  ⚠ Batas {MAX_IMAGES} gambar tercapai, sisanya dilewati "
+                                   f"(supaya server tidak kehabisan RAM)")
+                        skipped += 1
+                        continue
+
+                    fpath = os.path.join(root, fname)
+                    img = cv2.imread(fpath)
+                    if img is None:
+                        skipped += 1
+                        continue
+
+                    try:
+                        vec = preprocess_image(img, use_face_detection=True)
+                    except Exception:
+                        skipped += 1
+                        continue
+                    finally:
+                        del img
+
                     label = extract_label_from_filename(fname)
-                    file_label_pairs.append((os.path.join(root, fname), label))
+                    X.append(vec)
+                    labels.append(label)
 
-        total_files = len(file_label_pairs)
-        if log_fn:
-            log_fn(f"  {total_files} file gambar ditemukan, memproses satu per satu...")
-
-        # Proses satu per satu: baca -> ekstrak fitur -> buang gambar mentahnya
-        # segera (img dan vec sementara, tidak ada penumpukan array besar).
-        X, labels = [], []
-        skipped = 0
-        report_every = max(1, total_files // 10)  # update progress tiap ~10%
-
-        for idx, (fpath, label) in enumerate(file_label_pairs):
-            img = cv2.imread(fpath)
-            if img is None:
-                skipped += 1
-                continue
-            try:
-                vec = preprocess_image(img, use_face_detection=True)
-            except Exception:
-                skipped += 1
-                continue
-            finally:
-                del img  # lepas gambar mentah dari memori segera setelah dipakai
-
-            X.append(vec)
-            labels.append(label)
-
-            if progress_fn and (idx + 1) % report_every == 0:
-                progress_fn(idx + 1, total_files)
-            if (idx + 1) % 200 == 0:
-                gc.collect()  # bersihkan memori berkala saat dataset besar
-
-        if progress_fn:
-            progress_fn(total_files, total_files)
+                    if len(X) % GC_EVERY_N_IMGS == 0:
+                        gc.collect()
+                        if log_fn:
+                            log_fn(f"  ... {len(X)} gambar diproses")
 
         if len(X) == 0:
             raise ValueError(
-                "Tidak ada gambar valid ditemukan di dalam arsip. "
+                "Tidak ada gambar valid ditemukan di dalam ZIP. "
                 "Pastikan struktur folder per orang (nama_orang/foto.jpg) "
                 "atau nama file flat (nama_orang_nomor.jpg) sudah benar."
             )
@@ -501,14 +531,13 @@ def load_dataset_from_archive(archive_bytes: bytes, filename: str, log_fn=None, 
         if log_fn:
             log_fn(f"  ✓ {len(X)} gambar berhasil dibaca, {len(unique_labels)} orang terdeteksi")
             if skipped > 0:
-                log_fn(f"  ⚠ {skipped} file dilewati (gagal dibaca / wajah tidak terdeteksi)")
+                log_fn(f"  ⚠ {skipped} file dilewati (gagal dibaca / wajah tidak terdeteksi / melebihi batas)")
             for lbl in unique_labels:
                 count = labels.count(lbl)
                 log_fn(f"    - {lbl}: {count} foto")
 
-        X_arr = np.array(X, dtype=np.float64)
+        X_arr = np.array(X, dtype=np.float32)
         labels_arr = np.array(labels)
-        # Lepas list Python setelah dikonversi -> hindari dua salinan data sekaligus
         del X, labels
         gc.collect()
 
@@ -535,25 +564,20 @@ def run_training(X: np.ndarray, labels: np.ndarray, log_fn=None):
     # punya skala berbeda -> tanpa ini PCA bisa bias ke salah satu jenis fitur.
     if log_fn: log_fn("\nStandardisasi fitur (piksel + LBP)...")
     scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
+    X_scaled = scaler.fit_transform(X).astype(np.float32)
+    del X
+    gc.collect()
 
-    n_comp = min(N_COMPONENTS, X.shape[0] - 1, X.shape[1])
+    n_comp = min(N_COMPONENTS, X_scaled.shape[0] - 1, X_scaled.shape[1])
     if log_fn: log_fn(f"\nTraining PCA dengan {n_comp} komponen...")
 
-    # svd_solver="randomized" jauh lebih cepat & hemat memori dibanding "full"
-    # untuk kasus kita (ambil sebagian kecil komponen dari dimensi besar).
-    # Di uji coba lokal: ~13s (full) -> ~2.4s (randomized) untuk data sejenis.
-    # "full" menghitung SVD lengkap dari seluruh matriks meski cuma butuh
-    # n_comp komponen pertama -- sangat boros di server dengan CPU/RAM terbatas
-    # seperti Streamlit Community Cloud free tier.
-    t_start = time.time()
-    pca = PCA(n_components=n_comp, svd_solver="randomized", random_state=42)
+    pca = PCA(n_components=n_comp, svd_solver="full")
     X_pca = pca.fit_transform(X_scaled)
-    t_elapsed = time.time() - t_start
+    del X_scaled
+    gc.collect()
 
     explained = float(np.sum(pca.explained_variance_ratio_)) * 100
     if log_fn:
-        log_fn(f"  ✓ PCA selesai dalam {t_elapsed:.1f} detik")
         log_fn(f"  ✓ Explained variance: {explained:.1f}%")
         log_fn(f"  ✓ Dimensi PCA: {X_pca.shape}")
 
@@ -728,7 +752,7 @@ with tab_train:
                 st.error(str(e))
 
     else:  # Upload Arsip
-        st.markdown("""
+        st.markdown(f"""
         <div class="format-hint">
         📋 <strong>Format arsip yang didukung:</strong> <code>.zip</code> dan <code>.7z</code><br><br>
         <strong>Struktur isi (otomatis terdeteksi):</strong><br><br>
@@ -738,49 +762,45 @@ with tab_train:
         <strong>2. File rata (flat)</strong><br>
         <code>dataset/andi_1.jpg</code>, <code>dataset/budi_1.png</code><br>
         — nama orang diambil dari nama file sebelum angka terakhir<br><br>
-        Minimal 2 orang berbeda. Format gambar: jpg, jpeg, png, bmp, webp
+        Minimal 2 orang berbeda. Format gambar: jpg, jpeg, png, bmp, webp<br><br>
+        ⚠️ <strong>Batas server:</strong> ukuran arsip maks. {MAX_ARCHIVE_MB}MB, maks. {MAX_IMAGES} foto diproses
+        per training (sisanya otomatis dilewati). Kalau dataset lebih besar, kecilkan resolusi foto
+        sebelum di-zip atau pecah jadi beberapa batch training.
         </div>
         """, unsafe_allow_html=True)
         st.write("")
 
         archive_file = st.file_uploader("Upload file dataset (.zip atau .7z)", type=["zip", "7z"])
 
+        if archive_file is not None:
+            size_mb = archive_file.size / (1024 * 1024)
+            if size_mb > MAX_ARCHIVE_MB:
+                st.error(f"❌ Ukuran file {size_mb:.0f}MB melebihi batas {MAX_ARCHIVE_MB}MB.")
+            elif size_mb > MAX_ARCHIVE_MB * 0.7:
+                st.warning(f"⚠️ Ukuran file {size_mb:.0f}MB, mendekati batas {MAX_ARCHIVE_MB}MB. "
+                           f"Training mungkin butuh waktu lama / berisiko gagal kalau RAM server terbatas.")
+            else:
+                st.caption(f"📦 Ukuran file: {size_mb:.1f}MB")
+
         if st.button("🚀 Mulai Training (dari Arsip)", type="primary",
                       use_container_width=True, disabled=(archive_file is None)):
             st.session_state.train_log = []
             log_box = st.empty()
-            progress_bar = st.progress(0, text="Menyiapkan...")
             try:
-                archive_bytes = archive_file.read()
-
-                def update_progress(done, total):
-                    pct = done / total if total > 0 else 0
-                    progress_bar.progress(pct, text=f"Memproses foto {done}/{total}...")
-
-                X, labels = load_dataset_from_archive(
-                    archive_bytes, archive_file.name,
-                    log_fn=log, progress_fn=update_progress,
-                )
-                log_box.code("\n".join(st.session_state.train_log))
-                progress_bar.progress(1.0, text="Memproses foto selesai, melatih PCA...")
-
-                with st.spinner("Training PCA..."):
+                with st.spinner("Mengekstrak dan training... (dataset besar bisa makan waktu beberapa menit)"):
+                    archive_bytes = archive_file.read()
+                    X, labels = load_dataset_from_archive(archive_bytes, archive_file.name, log_fn=log)
+                    del archive_bytes
+                    gc.collect()
+                    log_box.code("\n".join(st.session_state.train_log))
                     model = run_training(X, labels, log_fn=log)
-                log_box.code("\n".join(st.session_state.train_log))
-
-                progress_bar.empty()
+                    log_box.code("\n".join(st.session_state.train_log))
                 st.session_state.model = model
                 st.rerun()
             except Exception as e:
-                progress_bar.empty()
                 log(f"\n❌ Error: {e}")
                 log_box.code("\n".join(st.session_state.train_log))
-                st.error(
-                    f"{e}\n\n"
-                    "Catatan: jika ini terjadi pada dataset besar (ratusan MB), "
-                    "kemungkinan penyebabnya server kehabisan memori (RAM). "
-                    "Coba kurangi jumlah foto / orang per batch training."
-                )
+                st.error(str(e))
 
     if st.session_state.train_log and st.session_state.model is None:
         with st.expander("📜 Log training terakhir", expanded=True):
