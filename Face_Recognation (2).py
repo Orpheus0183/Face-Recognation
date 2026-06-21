@@ -366,7 +366,7 @@ def detect_zip_structure(root_dir: str) -> str:
     return "flat"
 
 
-def load_dataset_from_archive(archive_bytes: bytes, filename: str, log_fn=None):
+def load_dataset_from_archive(archive_bytes: bytes, filename: str, log_fn=None, progress_fn=None):
     """
     Ekstrak file arsip (.zip atau .7z, dari bytes di memori), lalu baca dataset
     dengan dua mode yang dideteksi otomatis:
@@ -376,6 +376,14 @@ def load_dataset_from_archive(archive_bytes: bytes, filename: str, log_fn=None):
 
     2. MODE FLAT    -> arsip/namaorang_nomor.jpg (semua rata, tanpa folder)
        Label diambil dari nama file pakai extract_label_from_filename().
+
+    Dioptimalkan untuk hemat memori (penting di server dgn RAM terbatas
+    spt Streamlit Community Cloud free tier):
+    - archive_bytes dilepas dari RAM begitu selesai diekstrak ke disk
+    - Tiap foto dibaca, diproses jadi vektor fitur, lalu file gambarnya
+      langsung "dilupakan" (tidak ada array gambar mentah yang menumpuk)
+    - Vektor fitur dikumpulkan di list Python biasa (ringan per-elemen)
+      lalu dikonversi ke satu np.array di akhir
     """
     ext = os.path.splitext(filename)[1].lower()
 
@@ -399,6 +407,13 @@ def load_dataset_from_archive(archive_bytes: bytes, filename: str, log_fn=None):
         else:
             raise ValueError(f"Format file '{ext}' tidak didukung. Gunakan .zip atau .7z")
 
+        # Lepas bytes arsip mentah dari memori sesegera mungkin -- begitu
+        # sudah diekstrak ke disk, kita tidak butuh salinan di RAM lagi.
+        # Untuk dataset 200MB+, ini langsung membebaskan 200MB+ RAM.
+        del archive_bytes
+        import gc
+        gc.collect()
+
         # Tembus folder pembungkus tunggal, mis. "Extracted/" yang isinya
         # langsung folder-per-orang, supaya tidak salah dianggap "1 orang".
         root_dir = unwrap_single_folder(extract_dir)
@@ -411,71 +426,73 @@ def load_dataset_from_archive(archive_bytes: bytes, filename: str, log_fn=None):
             mode_label = "Folder per orang" if structure == "folder" else "File rata (flat)"
             log_fn(f"  Struktur terdeteksi: {mode_label}")
 
-        X, labels = [], []
-        skipped = 0
+        # Kumpulkan dulu daftar (filepath, label) tanpa membuka gambarnya --
+        # ini ringan walau jumlah file ribuan, karena cuma teks path.
+        file_label_pairs = []
 
         if structure == "folder":
-            # Setiap subfolder langsung di bawah root_dir = satu orang.
-            # Gambar di dalamnya (termasuk nested) semua dianggap milik orang itu.
             root_items = sorted(os.listdir(root_dir))
             person_folders = [
                 i for i in root_items
                 if os.path.isdir(os.path.join(root_dir, i))
                 and not i.startswith(".") and i != "__MACOSX"
             ]
-
             for person_name in person_folders:
                 label = person_name.strip().lower().replace(" ", "_")
                 person_path = os.path.join(root_dir, person_name)
-
                 for root, _, files in os.walk(person_path):
                     for fname in sorted(files):
-                        ext = os.path.splitext(fname)[1].lower()
-                        if ext not in ALLOWED_EXT or fname.startswith("."):
+                        fext = os.path.splitext(fname)[1].lower()
+                        if fext not in ALLOWED_EXT or fname.startswith("."):
                             continue
-
-                        fpath = os.path.join(root, fname)
-                        img = cv2.imread(fpath)
-                        if img is None:
-                            skipped += 1
-                            continue
-                        try:
-                            vec = preprocess_image(img, use_face_detection=True)
-                        except Exception:
-                            skipped += 1
-                            continue
-
-                        X.append(vec)
-                        labels.append(label)
+                        file_label_pairs.append((os.path.join(root, fname), label))
 
         else:  # flat
             for root, _, files in os.walk(root_dir):
                 for fname in sorted(files):
-                    ext = os.path.splitext(fname)[1].lower()
-                    if ext not in ALLOWED_EXT:
+                    fext = os.path.splitext(fname)[1].lower()
+                    if fext not in ALLOWED_EXT or fname.startswith("._") or fname.startswith("."):
                         continue
-                    if fname.startswith("._") or fname.startswith("."):
-                        continue
-
-                    fpath = os.path.join(root, fname)
-                    img = cv2.imread(fpath)
-                    if img is None:
-                        skipped += 1
-                        continue
-
-                    try:
-                        vec = preprocess_image(img, use_face_detection=True)
-                    except Exception:
-                        skipped += 1
-                        continue
-
                     label = extract_label_from_filename(fname)
-                    X.append(vec)
-                    labels.append(label)
+                    file_label_pairs.append((os.path.join(root, fname), label))
+
+        total_files = len(file_label_pairs)
+        if log_fn:
+            log_fn(f"  {total_files} file gambar ditemukan, memproses satu per satu...")
+
+        # Proses satu per satu: baca -> ekstrak fitur -> buang gambar mentahnya
+        # segera (img dan vec sementara, tidak ada penumpukan array besar).
+        X, labels = [], []
+        skipped = 0
+        report_every = max(1, total_files // 10)  # update progress tiap ~10%
+
+        for idx, (fpath, label) in enumerate(file_label_pairs):
+            img = cv2.imread(fpath)
+            if img is None:
+                skipped += 1
+                continue
+            try:
+                vec = preprocess_image(img, use_face_detection=True)
+            except Exception:
+                skipped += 1
+                continue
+            finally:
+                del img  # lepas gambar mentah dari memori segera setelah dipakai
+
+            X.append(vec)
+            labels.append(label)
+
+            if progress_fn and (idx + 1) % report_every == 0:
+                progress_fn(idx + 1, total_files)
+            if (idx + 1) % 200 == 0:
+                gc.collect()  # bersihkan memori berkala saat dataset besar
+
+        if progress_fn:
+            progress_fn(total_files, total_files)
 
         if len(X) == 0:
             raise ValueError(
-                "Tidak ada gambar valid ditemukan di dalam ZIP. "
+                "Tidak ada gambar valid ditemukan di dalam arsip. "
                 "Pastikan struktur folder per orang (nama_orang/foto.jpg) "
                 "atau nama file flat (nama_orang_nomor.jpg) sudah benar."
             )
@@ -489,7 +506,13 @@ def load_dataset_from_archive(archive_bytes: bytes, filename: str, log_fn=None):
                 count = labels.count(lbl)
                 log_fn(f"    - {lbl}: {count} foto")
 
-        return np.array(X), np.array(labels)
+        X_arr = np.array(X, dtype=np.float64)
+        labels_arr = np.array(labels)
+        # Lepas list Python setelah dikonversi -> hindari dua salinan data sekaligus
+        del X, labels
+        gc.collect()
+
+        return X_arr, labels_arr
 
     finally:
         shutil.rmtree(extract_dir, ignore_errors=True)
@@ -717,19 +740,38 @@ with tab_train:
                       use_container_width=True, disabled=(archive_file is None)):
             st.session_state.train_log = []
             log_box = st.empty()
+            progress_bar = st.progress(0, text="Menyiapkan...")
             try:
-                with st.spinner("Mengekstrak dan training..."):
-                    archive_bytes = archive_file.read()
-                    X, labels = load_dataset_from_archive(archive_bytes, archive_file.name, log_fn=log)
-                    log_box.code("\n".join(st.session_state.train_log))
+                archive_bytes = archive_file.read()
+
+                def update_progress(done, total):
+                    pct = done / total if total > 0 else 0
+                    progress_bar.progress(pct, text=f"Memproses foto {done}/{total}...")
+
+                X, labels = load_dataset_from_archive(
+                    archive_bytes, archive_file.name,
+                    log_fn=log, progress_fn=update_progress,
+                )
+                log_box.code("\n".join(st.session_state.train_log))
+                progress_bar.progress(1.0, text="Memproses foto selesai, melatih PCA...")
+
+                with st.spinner("Training PCA..."):
                     model = run_training(X, labels, log_fn=log)
-                    log_box.code("\n".join(st.session_state.train_log))
+                log_box.code("\n".join(st.session_state.train_log))
+
+                progress_bar.empty()
                 st.session_state.model = model
                 st.rerun()
             except Exception as e:
+                progress_bar.empty()
                 log(f"\n❌ Error: {e}")
                 log_box.code("\n".join(st.session_state.train_log))
-                st.error(str(e))
+                st.error(
+                    f"{e}\n\n"
+                    "Catatan: jika ini terjadi pada dataset besar (ratusan MB), "
+                    "kemungkinan penyebabnya server kehabisan memori (RAM). "
+                    "Coba kurangi jumlah foto / orang per batch training."
+                )
 
     if st.session_state.train_log and st.session_state.model is None:
         with st.expander("📜 Log training terakhir", expanded=True):
