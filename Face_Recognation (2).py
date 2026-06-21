@@ -1248,6 +1248,12 @@ with tab_compare:
             if file2:
                 st.image(file2, use_container_width=True)
 
+        if st.session_state.get("__reset_weights"):
+            st.session_state["w_cosine"] = 0.45
+            st.session_state["w_euclidean"] = 0.30
+            st.session_state["w_ssim"] = 0.25
+            st.session_state["__reset_weights"] = False
+
         with st.expander("⚙️ Bobot Skor (lanjutan)", expanded=False):
             st.caption(
                 "Atur kontribusi tiap sinyal similarity ke skor akhir. "
@@ -1255,11 +1261,23 @@ with tab_compare:
             )
             wc1, wc2, wc3 = st.columns(3)
             with wc1:
-                weight_cosine = st.slider("Cosine (Modular PCA)", 0.0, 1.0, 0.45, 0.05)
+                weight_cosine = st.slider("Cosine (Modular PCA)", 0.0, 1.0, 0.45, 0.05, key="w_cosine")
             with wc2:
-                weight_euclidean = st.slider("Euclidean (Modular PCA)", 0.0, 1.0, 0.30, 0.05)
+                weight_euclidean = st.slider("Euclidean (Modular PCA)", 0.0, 1.0, 0.30, 0.05, key="w_euclidean")
             with wc3:
-                weight_ssim = st.slider("SSIM (Struktur Piksel)", 0.0, 1.0, 0.25, 0.05)
+                weight_ssim = st.slider("SSIM (Struktur Piksel)", 0.0, 1.0, 0.25, 0.05, key="w_ssim")
+
+            total_weight_check = weight_cosine + weight_euclidean + weight_ssim
+            if total_weight_check <= 0.01:
+                st.warning(
+                    "⚠️ Semua bobot di angka 0 (atau mendekati 0) — skor akhir tidak akan "
+                    "merepresentasikan similarity yang sebenarnya. Geser minimal satu slider "
+                    "ke nilai > 0, atau gunakan tombol reset di bawah.",
+                    icon="⚠️",
+                )
+            if st.button("↺ Reset Bobot ke Default (0.45 / 0.30 / 0.25)"):
+                st.session_state["__reset_weights"] = True
+                st.rerun()
 
         analyze_disabled = not (file1 and file2)
         if st.button("🔎 Analisis Kemiripan", type="primary",
