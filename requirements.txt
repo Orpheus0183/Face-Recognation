@@ -7,4 +7,3 @@ py7zr
 requests
 mediapipe==0.10.13
 scikit-image
- 
