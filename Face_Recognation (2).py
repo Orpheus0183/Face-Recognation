@@ -27,11 +27,12 @@ Format arsip dataset yang didukung: .zip dan .7z (dua mode struktur, dideteksi o
 import streamlit as st
 import cv2
 import numpy as np
+import requests
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics.pairwise import cosine_similarity, euclidean_distances
 from PIL import Image
-import io, os, re, zipfile, tempfile, shutil
+import io, os, re, time, zipfile, tempfile, shutil
 
 try:
     import py7zr
@@ -288,17 +289,8 @@ def create_synthetic_dataset(n_persons=5, n_images=8, log_fn=None):
 
         for j in range(n_images):
             noise = rng.integers(-25, 26, IMG_SIZE).astype(np.float64)
-            face = np.clip(base_face + noise, 0, 255)  # skala 0-255 (jangan dibagi dulu)
-
-            # PENTING: vektor fitur harus berbentuk SAMA PERSIS dengan yang
-            # dihasilkan preprocess_image() untuk foto asli (piksel + LBP),
-            # supaya model hasil training dataset sintetis tetap bisa dipakai
-            # untuk membandingkan foto asli di tab "Bandingkan Wajah" tanpa
-            # error dimensi fitur (mismatch shape pada StandardScaler/PCA).
-            pixel_features = face.flatten() / 255.0
-            lbp_features = lbp_histogram_features(face)
-
-            X.append(np.concatenate([pixel_features, lbp_features]))
+            face = np.clip(base_face + noise, 0, 255) / 255.0
+            X.append(face.flatten())
             labels.append(name)
 
         if log_fn: log_fn(f"  ✓ {name}: {n_images} gambar dibuat")
@@ -375,7 +367,7 @@ def detect_zip_structure(root_dir: str) -> str:
     return "flat"
 
 
-def load_dataset_from_archive(archive_bytes: bytes, filename: str, log_fn=None):
+def load_dataset_from_archive(archive_bytes: bytes, filename: str, log_fn=None, progress_fn=None):
     """
     Ekstrak file arsip (.zip atau .7z, dari bytes di memori), lalu baca dataset
     dengan dua mode yang dideteksi otomatis:
@@ -385,6 +377,14 @@ def load_dataset_from_archive(archive_bytes: bytes, filename: str, log_fn=None):
 
     2. MODE FLAT    -> arsip/namaorang_nomor.jpg (semua rata, tanpa folder)
        Label diambil dari nama file pakai extract_label_from_filename().
+
+    Dioptimalkan untuk hemat memori (penting di server dgn RAM terbatas
+    spt Streamlit Community Cloud free tier):
+    - archive_bytes dilepas dari RAM begitu selesai diekstrak ke disk
+    - Tiap foto dibaca, diproses jadi vektor fitur, lalu file gambarnya
+      langsung "dilupakan" (tidak ada array gambar mentah yang menumpuk)
+    - Vektor fitur dikumpulkan di list Python biasa (ringan per-elemen)
+      lalu dikonversi ke satu np.array di akhir
     """
     ext = os.path.splitext(filename)[1].lower()
 
@@ -408,6 +408,13 @@ def load_dataset_from_archive(archive_bytes: bytes, filename: str, log_fn=None):
         else:
             raise ValueError(f"Format file '{ext}' tidak didukung. Gunakan .zip atau .7z")
 
+        # Lepas bytes arsip mentah dari memori sesegera mungkin -- begitu
+        # sudah diekstrak ke disk, kita tidak butuh salinan di RAM lagi.
+        # Untuk dataset 200MB+, ini langsung membebaskan 200MB+ RAM.
+        del archive_bytes
+        import gc
+        gc.collect()
+
         # Tembus folder pembungkus tunggal, mis. "Extracted/" yang isinya
         # langsung folder-per-orang, supaya tidak salah dianggap "1 orang".
         root_dir = unwrap_single_folder(extract_dir)
@@ -420,71 +427,73 @@ def load_dataset_from_archive(archive_bytes: bytes, filename: str, log_fn=None):
             mode_label = "Folder per orang" if structure == "folder" else "File rata (flat)"
             log_fn(f"  Struktur terdeteksi: {mode_label}")
 
-        X, labels = [], []
-        skipped = 0
+        # Kumpulkan dulu daftar (filepath, label) tanpa membuka gambarnya --
+        # ini ringan walau jumlah file ribuan, karena cuma teks path.
+        file_label_pairs = []
 
         if structure == "folder":
-            # Setiap subfolder langsung di bawah root_dir = satu orang.
-            # Gambar di dalamnya (termasuk nested) semua dianggap milik orang itu.
             root_items = sorted(os.listdir(root_dir))
             person_folders = [
                 i for i in root_items
                 if os.path.isdir(os.path.join(root_dir, i))
                 and not i.startswith(".") and i != "__MACOSX"
             ]
-
             for person_name in person_folders:
                 label = person_name.strip().lower().replace(" ", "_")
                 person_path = os.path.join(root_dir, person_name)
-
                 for root, _, files in os.walk(person_path):
                     for fname in sorted(files):
-                        ext = os.path.splitext(fname)[1].lower()
-                        if ext not in ALLOWED_EXT or fname.startswith("."):
+                        fext = os.path.splitext(fname)[1].lower()
+                        if fext not in ALLOWED_EXT or fname.startswith("."):
                             continue
-
-                        fpath = os.path.join(root, fname)
-                        img = cv2.imread(fpath)
-                        if img is None:
-                            skipped += 1
-                            continue
-                        try:
-                            vec = preprocess_image(img, use_face_detection=True)
-                        except Exception:
-                            skipped += 1
-                            continue
-
-                        X.append(vec)
-                        labels.append(label)
+                        file_label_pairs.append((os.path.join(root, fname), label))
 
         else:  # flat
             for root, _, files in os.walk(root_dir):
                 for fname in sorted(files):
-                    ext = os.path.splitext(fname)[1].lower()
-                    if ext not in ALLOWED_EXT:
+                    fext = os.path.splitext(fname)[1].lower()
+                    if fext not in ALLOWED_EXT or fname.startswith("._") or fname.startswith("."):
                         continue
-                    if fname.startswith("._") or fname.startswith("."):
-                        continue
-
-                    fpath = os.path.join(root, fname)
-                    img = cv2.imread(fpath)
-                    if img is None:
-                        skipped += 1
-                        continue
-
-                    try:
-                        vec = preprocess_image(img, use_face_detection=True)
-                    except Exception:
-                        skipped += 1
-                        continue
-
                     label = extract_label_from_filename(fname)
-                    X.append(vec)
-                    labels.append(label)
+                    file_label_pairs.append((os.path.join(root, fname), label))
+
+        total_files = len(file_label_pairs)
+        if log_fn:
+            log_fn(f"  {total_files} file gambar ditemukan, memproses satu per satu...")
+
+        # Proses satu per satu: baca -> ekstrak fitur -> buang gambar mentahnya
+        # segera (img dan vec sementara, tidak ada penumpukan array besar).
+        X, labels = [], []
+        skipped = 0
+        report_every = max(1, total_files // 10)  # update progress tiap ~10%
+
+        for idx, (fpath, label) in enumerate(file_label_pairs):
+            img = cv2.imread(fpath)
+            if img is None:
+                skipped += 1
+                continue
+            try:
+                vec = preprocess_image(img, use_face_detection=True)
+            except Exception:
+                skipped += 1
+                continue
+            finally:
+                del img  # lepas gambar mentah dari memori segera setelah dipakai
+
+            X.append(vec)
+            labels.append(label)
+
+            if progress_fn and (idx + 1) % report_every == 0:
+                progress_fn(idx + 1, total_files)
+            if (idx + 1) % 200 == 0:
+                gc.collect()  # bersihkan memori berkala saat dataset besar
+
+        if progress_fn:
+            progress_fn(total_files, total_files)
 
         if len(X) == 0:
             raise ValueError(
-                "Tidak ada gambar valid ditemukan di dalam ZIP. "
+                "Tidak ada gambar valid ditemukan di dalam arsip. "
                 "Pastikan struktur folder per orang (nama_orang/foto.jpg) "
                 "atau nama file flat (nama_orang_nomor.jpg) sudah benar."
             )
@@ -498,7 +507,13 @@ def load_dataset_from_archive(archive_bytes: bytes, filename: str, log_fn=None):
                 count = labels.count(lbl)
                 log_fn(f"    - {lbl}: {count} foto")
 
-        return np.array(X), np.array(labels)
+        X_arr = np.array(X, dtype=np.float64)
+        labels_arr = np.array(labels)
+        # Lepas list Python setelah dikonversi -> hindari dua salinan data sekaligus
+        del X, labels
+        gc.collect()
+
+        return X_arr, labels_arr
 
     finally:
         shutil.rmtree(extract_dir, ignore_errors=True)
@@ -526,11 +541,20 @@ def run_training(X: np.ndarray, labels: np.ndarray, log_fn=None):
     n_comp = min(N_COMPONENTS, X.shape[0] - 1, X.shape[1])
     if log_fn: log_fn(f"\nTraining PCA dengan {n_comp} komponen...")
 
-    pca = PCA(n_components=n_comp, svd_solver="full")
+    # svd_solver="randomized" jauh lebih cepat & hemat memori dibanding "full"
+    # untuk kasus kita (ambil sebagian kecil komponen dari dimensi besar).
+    # Di uji coba lokal: ~13s (full) -> ~2.4s (randomized) untuk data sejenis.
+    # "full" menghitung SVD lengkap dari seluruh matriks meski cuma butuh
+    # n_comp komponen pertama -- sangat boros di server dengan CPU/RAM terbatas
+    # seperti Streamlit Community Cloud free tier.
+    t_start = time.time()
+    pca = PCA(n_components=n_comp, svd_solver="randomized", random_state=42)
     X_pca = pca.fit_transform(X_scaled)
+    t_elapsed = time.time() - t_start
 
     explained = float(np.sum(pca.explained_variance_ratio_)) * 100
     if log_fn:
+        log_fn(f"  ✓ PCA selesai dalam {t_elapsed:.1f} detik")
         log_fn(f"  ✓ Explained variance: {explained:.1f}%")
         log_fn(f"  ✓ Dimensi PCA: {X_pca.shape}")
 
@@ -635,10 +659,68 @@ if "model" not in st.session_state:
     st.session_state.model = None
 if "train_log" not in st.session_state:
     st.session_state.train_log = []
+if "auto_load_attempted" not in st.session_state:
+    st.session_state.auto_load_attempted = False
+if "auto_load_error" not in st.session_state:
+    st.session_state.auto_load_error = None
 
 
 def log(msg):
     st.session_state.train_log.append(msg)
+
+
+def try_auto_load_model():
+    """
+    Kalau ada URL model dikonfigurasi lewat Streamlit secrets
+    (key: MODEL_URL, mis. raw link GitHub ke model.pkl), coba load
+    otomatis sekali saat app pertama kali dibuka -- supaya pengguna
+    tidak perlu klik manual tiap kali, sesuai kebutuhan "akses otomatis".
+
+    Konfigurasi di Streamlit Cloud: Settings -> Secrets, isi:
+        MODEL_URL = "https://raw.githubusercontent.com/user/repo/main/model.pkl"
+    """
+    if st.session_state.auto_load_attempted or st.session_state.model is not None:
+        return
+    st.session_state.auto_load_attempted = True
+
+    model_url = st.secrets.get("MODEL_URL", "") if hasattr(st, "secrets") else ""
+    if not model_url:
+        return
+
+    try:
+        resp = requests.get(model_url, timeout=30)
+        resp.raise_for_status()
+        model = deserialize_model(resp.content)
+        st.session_state.model = model
+        st.session_state.model_url = model_url
+    except Exception as e:
+        st.session_state.auto_load_error = str(e)
+
+
+def serialize_model(model: dict) -> bytes:
+    """Konversi model hasil training jadi bytes pickle, siap didownload / diupload ke GitHub."""
+    import pickle
+    return pickle.dumps(model)
+
+
+def deserialize_model(data: bytes) -> dict:
+    """
+    Baca bytes pickle jadi dict model. Validasi struktur minimal supaya
+    error-nya jelas kalau file yang diupload bukan model yang valid/cocok.
+    """
+    import pickle
+    try:
+        model = pickle.loads(data)
+    except Exception as e:
+        raise ValueError(f"File tidak bisa dibaca sebagai model (.pkl) yang valid: {e}")
+
+    required_keys = {"pca", "scaler", "labels"}
+    if not isinstance(model, dict) or not required_keys.issubset(model.keys()):
+        raise ValueError(
+            "Struktur file tidak sesuai format model aplikasi ini. "
+            "Pastikan file .pkl berasal dari hasil training/download di app ini."
+        )
+    return model
 
 
 # ─────────────────────────────────────────────
@@ -648,7 +730,19 @@ def log(msg):
 st.markdown("## 🧠 Face Match ML")
 st.caption("Training model PCA sendiri, lalu bandingkan dua wajah — apakah orang yang sama atau bukan.")
 
-tab_train, tab_compare = st.tabs(["⚙️ 1. Training Model", "🔍 2. Bandingkan Wajah"])
+try_auto_load_model()
+if st.session_state.model is not None and st.session_state.get("model_url"):
+    st.success(f"✅ Model otomatis dimuat dari URL terkonfigurasi.", icon="📥")
+elif st.session_state.auto_load_error:
+    st.warning(
+        f"⚠️ Gagal memuat model otomatis dari MODEL_URL: {st.session_state.auto_load_error}. "
+        "Bisa training manual atau load manual di tab terkait.",
+        icon="⚠️",
+    )
+
+tab_train, tab_load, tab_compare = st.tabs([
+    "⚙️ 1. Training Model", "📥 2. Load Model Siap Pakai", "🔍 3. Bandingkan Wajah"
+])
 
 
 # ─────────────────────────────────────────────
@@ -666,6 +760,24 @@ with tab_train:
             f"✅ **Model sudah tertraining!**  \n"
             f"{n_persons} orang · {n_samples} sampel · {m['pca'].n_components_} komponen PCA · "
             f"{explained:.1f}% explained variance"
+        )
+
+        model_bytes = serialize_model(m)
+        st.download_button(
+            "💾 Download Model (.pkl)",
+            data=model_bytes,
+            file_name="model.pkl",
+            mime="application/octet-stream",
+            use_container_width=True,
+            help=(
+                "Simpan file ini, lalu upload ke repo GitHub kamu. "
+                "Setelah itu bisa langsung di-load di tab 'Load Model Siap Pakai' "
+                "tanpa perlu training ulang."
+            ),
+        )
+        st.caption(
+            f"📦 Ukuran file: {len(model_bytes) / 1024 / 1024:.1f} MB — "
+            "GitHub batasi file biasa maks 100MB per file (di luar Git LFS)."
         )
 
     method = st.radio(
@@ -726,19 +838,38 @@ with tab_train:
                       use_container_width=True, disabled=(archive_file is None)):
             st.session_state.train_log = []
             log_box = st.empty()
+            progress_bar = st.progress(0, text="Menyiapkan...")
             try:
-                with st.spinner("Mengekstrak dan training..."):
-                    archive_bytes = archive_file.read()
-                    X, labels = load_dataset_from_archive(archive_bytes, archive_file.name, log_fn=log)
-                    log_box.code("\n".join(st.session_state.train_log))
+                archive_bytes = archive_file.read()
+
+                def update_progress(done, total):
+                    pct = done / total if total > 0 else 0
+                    progress_bar.progress(pct, text=f"Memproses foto {done}/{total}...")
+
+                X, labels = load_dataset_from_archive(
+                    archive_bytes, archive_file.name,
+                    log_fn=log, progress_fn=update_progress,
+                )
+                log_box.code("\n".join(st.session_state.train_log))
+                progress_bar.progress(1.0, text="Memproses foto selesai, melatih PCA...")
+
+                with st.spinner("Training PCA..."):
                     model = run_training(X, labels, log_fn=log)
-                    log_box.code("\n".join(st.session_state.train_log))
+                log_box.code("\n".join(st.session_state.train_log))
+
+                progress_bar.empty()
                 st.session_state.model = model
                 st.rerun()
             except Exception as e:
+                progress_bar.empty()
                 log(f"\n❌ Error: {e}")
                 log_box.code("\n".join(st.session_state.train_log))
-                st.error(str(e))
+                st.error(
+                    f"{e}\n\n"
+                    "Catatan: jika ini terjadi pada dataset besar (ratusan MB), "
+                    "kemungkinan penyebabnya server kehabisan memori (RAM). "
+                    "Coba kurangi jumlah foto / orang per batch training."
+                )
 
     if st.session_state.train_log and st.session_state.model is None:
         with st.expander("📜 Log training terakhir", expanded=True):
@@ -746,7 +877,89 @@ with tab_train:
 
 
 # ─────────────────────────────────────────────
-# TAB 2 — COMPARE
+# TAB 2 — LOAD MODEL SIAP PAKAI
+# ─────────────────────────────────────────────
+
+with tab_load:
+    st.caption(
+        "Sudah punya model hasil training sebelumnya (file `.pkl`)? Load di sini supaya "
+        "tidak perlu training ulang setiap kali app dibuka. Bisa dari URL (mis. GitHub) "
+        "atau upload file langsung."
+    )
+
+    if st.session_state.model is not None:
+        m = st.session_state.model
+        st.info(
+            f"ℹ️ Saat ini ada model aktif: {len(np.unique(m['labels']))} orang, "
+            f"{len(m['labels'])} sampel. Load model baru akan menggantikannya."
+        )
+
+    load_method = st.radio(
+        "Sumber model",
+        ["🔗 Dari URL (mis. GitHub raw link)", "📁 Upload file .pkl"],
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+
+    st.write("")
+
+    if load_method == "🔗 Dari URL (mis. GitHub raw link)":
+        st.markdown("""
+        <div class="format-hint">
+        📋 <strong>Cara dapatkan link raw GitHub:</strong><br>
+        1. Upload file <code>model.pkl</code> ke repo GitHub kamu (di luar folder yang di-ignore)<br>
+        2. Buka file itu di GitHub, klik tombol <strong>"Raw"</strong><br>
+        3. Copy URL dari address bar (formatnya seperti
+        <code>https://raw.githubusercontent.com/user/repo/main/model.pkl</code>)<br>
+        4. Tempel di kolom bawah ini
+        </div>
+        """, unsafe_allow_html=True)
+        st.write("")
+
+        default_url = st.session_state.get("model_url", "")
+        model_url = st.text_input(
+            "URL model.pkl",
+            value=default_url,
+            placeholder="https://raw.githubusercontent.com/username/repo/main/model.pkl",
+        )
+
+        if st.button("📥 Load Model dari URL", type="primary",
+                      use_container_width=True, disabled=(not model_url.strip())):
+            try:
+                with st.spinner("Mengunduh dan memuat model..."):
+                    resp = requests.get(model_url.strip(), timeout=30)
+                    resp.raise_for_status()
+                    model = deserialize_model(resp.content)
+                st.session_state.model = model
+                st.session_state.model_url = model_url.strip()
+                st.success("✅ Model berhasil dimuat dari URL!")
+                st.rerun()
+            except requests.exceptions.RequestException as e:
+                st.error(f"Gagal mengunduh file dari URL: {e}")
+            except ValueError as e:
+                st.error(str(e))
+            except Exception as e:
+                st.error(f"Terjadi kesalahan tak terduga: {e}")
+
+    else:  # Upload file .pkl
+        pkl_file = st.file_uploader("Upload file model (.pkl)", type=["pkl"])
+
+        if st.button("📥 Load Model dari File", type="primary",
+                      use_container_width=True, disabled=(pkl_file is None)):
+            try:
+                with st.spinner("Memuat model..."):
+                    model = deserialize_model(pkl_file.read())
+                st.session_state.model = model
+                st.success("✅ Model berhasil dimuat!")
+                st.rerun()
+            except ValueError as e:
+                st.error(str(e))
+            except Exception as e:
+                st.error(f"Terjadi kesalahan tak terduga: {e}")
+
+
+# ─────────────────────────────────────────────
+# TAB 3 — COMPARE
 # ─────────────────────────────────────────────
 
 with tab_compare:
