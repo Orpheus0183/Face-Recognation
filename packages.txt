@@ -1,6 +1,0 @@
-libgl1
-libglib2.0-0/trixie
-libsm6
-libxext6
-libxrender1
-libgomp1
