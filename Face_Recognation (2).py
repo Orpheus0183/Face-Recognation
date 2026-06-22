@@ -402,6 +402,62 @@ def extract_label_from_filename(filename: str) -> str:
 # DATASET SINTETIS
 # ─────────────────────────────────────────────
 
+def merge_datasets(acc, new_data):
+    """
+    Gabungkan dataset baru (modules, lbp, hog, labels) ke akumulator dataset
+    yang sudah ada. Hemat memori: hanya menyimpan fitur yang sudah diekstrak
+    (modul piksel + LBP + HOG, ~140KB/foto) -- bukan gambar mentah -- sehingga
+    upload berkali-kali tidak menumpuk RAM secara signifikan.
+
+    PCA itu sendiri TIDAK bisa "ditambah" inkremental tanpa training ulang
+    (lihat catatan run_training), karena ruang PCA optimal untuk N data
+    berbeda dari ruang PCA optimal untuk N+M data. Maka strategi yang dipakai
+    di sini adalah: akumulasi fitur mentah (murah secara memori), lalu
+    training PCA dipanggil ulang sekali saat tombol "Latih Model" ditekan
+    -- bukan otomatis tiap upload, supaya upload berkali-kali tetap cepat
+    dan training (yang lebih berat) cuma terjadi saat memang diminta.
+
+    new_data: tuple (modules_by_position, lbp_arr, hog_arr, labels_arr)
+    acc: None (kosong) atau tuple format sama dari panggilan sebelumnya.
+    """
+    new_modules, new_lbp, new_hog, new_labels = new_data
+
+    if acc is None:
+        return new_modules, new_lbp, new_hog, new_labels
+
+    old_modules, old_lbp, old_hog, old_labels = acc
+
+    if len(old_modules) != len(new_modules):
+        raise ValueError(
+            f"Jumlah modul tidak cocok ({len(old_modules)} vs {len(new_modules)}). "
+            "Kemungkinan konfigurasi MODULE_GRID berubah di antara upload -- "
+            "reset dataset dan upload ulang semua dari awal."
+        )
+
+    merged_modules = [
+        np.concatenate([old_modules[i], new_modules[i]], axis=0)
+        for i in range(len(old_modules))
+    ]
+    merged_lbp = np.concatenate([old_lbp, new_lbp], axis=0)
+    merged_hog = np.concatenate([old_hog, new_hog], axis=0)
+    merged_labels = np.concatenate([old_labels, new_labels], axis=0)
+
+    return merged_modules, merged_lbp, merged_hog, merged_labels
+
+
+def dataset_accumulator_stats(acc):
+    """Ringkasan ukuran akumulator dataset saat ini (untuk ditampilkan di UI)."""
+    if acc is None:
+        return {"n_samples": 0, "n_persons": 0, "size_mb": 0.0}
+    modules, lbp_arr, hog_arr, labels = acc
+    size_bytes = sum(m.nbytes for m in modules) + lbp_arr.nbytes + hog_arr.nbytes
+    return {
+        "n_samples": len(labels),
+        "n_persons": len(np.unique(labels)),
+        "size_mb": size_bytes / 1024 / 1024,
+    }
+
+
 def create_synthetic_dataset(n_persons=5, n_images=8, log_fn=None):
     """
     Buat dataset sintetis: setiap orang punya 'wajah dasar' unik + variasi noise.
@@ -931,6 +987,8 @@ if "auto_load_attempted" not in st.session_state:
     st.session_state.auto_load_attempted = False
 if "auto_load_error" not in st.session_state:
     st.session_state.auto_load_error = None
+if "dataset_acc" not in st.session_state:
+    st.session_state.dataset_acc = None  # akumulator (modules, lbp, hog, labels) sebelum training
 
 
 def log(msg):
@@ -1050,6 +1108,41 @@ with tab_train:
             f"📦 Ukuran file: {len(model_bytes) / 1024 / 1024:.1f} MB — "
             "GitHub batasi file biasa maks 100MB per file (di luar Git LFS)."
         )
+        st.markdown("---")
+
+    # ── Status akumulator dataset (sebelum training) ──
+    acc_stats = dataset_accumulator_stats(st.session_state.dataset_acc)
+    if acc_stats["n_samples"] > 0:
+        st.info(
+            f"📊 **Dataset terkumpul (belum dilatih):** "
+            f"{acc_stats['n_persons']} orang · {acc_stats['n_samples']} sampel · "
+            f"~{acc_stats['size_mb']:.1f} MB di memori.\n\n"
+            "Upload arsip lagi untuk **menambahkan** lebih banyak data (orang/foto baru "
+            "akan digabung, bukan menggantikan), atau langsung klik **Latih Model** "
+            "di bawah untuk training dari data yang sudah terkumpul.",
+            icon="📊",
+        )
+        col_train, col_reset = st.columns([3, 1])
+        with col_train:
+            if st.button("🚀 Latih Model dari Dataset Terkumpul", type="primary", use_container_width=True):
+                st.session_state.train_log = []
+                log_box = st.empty()
+                try:
+                    with st.spinner("Training PCA dari dataset gabungan..."):
+                        modules, lbp_arr, hog_arr, labels = st.session_state.dataset_acc
+                        model = run_training(modules, lbp_arr, hog_arr, labels, log_fn=log)
+                        log_box.code("\n".join(st.session_state.train_log))
+                    st.session_state.model = model
+                    st.rerun()
+                except Exception as e:
+                    log(f"\n❌ Error: {e}")
+                    log_box.code("\n".join(st.session_state.train_log))
+                    st.error(str(e))
+        with col_reset:
+            if st.button("🗑️ Reset Dataset", use_container_width=True):
+                st.session_state.dataset_acc = None
+                st.rerun()
+        st.markdown("---")
 
     method = st.radio(
         "Pilih metode dataset",
@@ -1063,7 +1156,9 @@ with tab_train:
     if method == "🎲 Dataset Sintetis":
         st.caption(
             "Generate dataset sintetis otomatis. Setiap orang punya pola piksel unik + variasi noise, "
-            "lalu PCA/SVD mereduksi dimensinya ke eigenfaces. Cocok untuk uji coba cepat tanpa dataset asli."
+            "lalu PCA/SVD mereduksi dimensinya ke eigenfaces. Cocok untuk uji coba cepat tanpa dataset asli. "
+            "⚠️ Data sintetis ditambahkan ke akumulator yang sama dengan upload arsip asli -- "
+            "campur keduanya hanya disarankan untuk eksperimen, bukan dataset final."
         )
         col1, col2 = st.columns(2)
         with col1:
@@ -1071,16 +1166,17 @@ with tab_train:
         with col2:
             n_images = st.slider("Foto per Orang", 3, 20, 8)
 
-        if st.button("🚀 Mulai Training (Sintetis)", type="primary", use_container_width=True):
+        if st.button("➕ Tambahkan ke Dataset (Sintetis)", type="primary", use_container_width=True):
             st.session_state.train_log = []
             log_box = st.empty()
             try:
-                with st.spinner("Training berjalan..."):
-                    modules, lbp_arr, hog_arr, labels = create_synthetic_dataset(n_persons, n_images, log_fn=log)
+                with st.spinner("Menggenerate & mengekstrak fitur..."):
+                    new_data = create_synthetic_dataset(n_persons, n_images, log_fn=log)
                     log_box.code("\n".join(st.session_state.train_log))
-                    model = run_training(modules, lbp_arr, hog_arr, labels, log_fn=log)
-                    log_box.code("\n".join(st.session_state.train_log))
-                st.session_state.model = model
+                    st.session_state.dataset_acc = merge_datasets(st.session_state.dataset_acc, new_data)
+                stats = dataset_accumulator_stats(st.session_state.dataset_acc)
+                log(f"\n✅ Ditambahkan ke akumulator. Total sekarang: {stats['n_persons']} orang, {stats['n_samples']} sampel.")
+                log_box.code("\n".join(st.session_state.train_log))
                 st.rerun()
             except Exception as e:
                 log(f"\n❌ Error: {e}")
@@ -1098,14 +1194,17 @@ with tab_train:
         <strong>2. File rata (flat)</strong><br>
         <code>dataset/andi_1.jpg</code>, <code>dataset/budi_1.png</code><br>
         — nama orang diambil dari nama file sebelum angka terakhir<br><br>
-        Minimal 2 orang berbeda. Format gambar: jpg, jpeg, png, bmp, webp
+        Minimal 2 orang berbeda (total, gabungan semua upload). Format gambar: jpg, jpeg, png, bmp, webp<br><br>
+        💡 <strong>Bisa upload berkali-kali</strong> — tiap arsip baru akan <strong>ditambahkan</strong>
+        ke dataset yang sudah terkumpul, bukan menggantikannya. Cocok untuk gabung beberapa
+        sumber dataset (mis. dataset A 50 orang + dataset B 40 orang = 90 orang).
         </div>
         """, unsafe_allow_html=True)
         st.write("")
 
         archive_file = st.file_uploader("Upload file dataset (.zip atau .7z)", type=["zip", "7z"])
 
-        if st.button("🚀 Mulai Training (dari Arsip)", type="primary",
+        if st.button("➕ Tambahkan ke Dataset (dari Arsip)", type="primary",
                       use_container_width=True, disabled=(archive_file is None)):
             st.session_state.train_log = []
             log_box = st.empty()
@@ -1117,19 +1216,19 @@ with tab_train:
                     pct = done / total if total > 0 else 0
                     progress_bar.progress(pct, text=f"Memproses foto {done}/{total}...")
 
-                modules, lbp_arr, hog_arr, labels = load_dataset_from_archive(
+                new_data = load_dataset_from_archive(
                     archive_bytes, archive_file.name,
                     log_fn=log, progress_fn=update_progress,
                 )
                 log_box.code("\n".join(st.session_state.train_log))
-                progress_bar.progress(1.0, text="Memproses foto selesai, melatih PCA...")
+                progress_bar.progress(1.0, text="Menggabungkan ke dataset...")
 
-                with st.spinner("Training PCA..."):
-                    model = run_training(modules, lbp_arr, hog_arr, labels, log_fn=log)
+                st.session_state.dataset_acc = merge_datasets(st.session_state.dataset_acc, new_data)
+                stats = dataset_accumulator_stats(st.session_state.dataset_acc)
+                log(f"\n✅ Ditambahkan ke akumulator. Total sekarang: {stats['n_persons']} orang, {stats['n_samples']} sampel (~{stats['size_mb']:.1f} MB).")
                 log_box.code("\n".join(st.session_state.train_log))
 
                 progress_bar.empty()
-                st.session_state.model = model
                 st.rerun()
             except Exception as e:
                 progress_bar.empty()
@@ -1139,11 +1238,11 @@ with tab_train:
                     f"{e}\n\n"
                     "Catatan: jika ini terjadi pada dataset besar (ratusan MB), "
                     "kemungkinan penyebabnya server kehabisan memori (RAM). "
-                    "Coba kurangi jumlah foto / orang per batch training."
+                    "Coba kurangi jumlah foto / orang per batch upload."
                 )
 
     if st.session_state.train_log and st.session_state.model is None:
-        with st.expander("📜 Log training terakhir", expanded=True):
+        with st.expander("📜 Log terakhir", expanded=True):
             st.code("\n".join(st.session_state.train_log))
 
 
