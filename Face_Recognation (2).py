@@ -42,14 +42,14 @@ except ImportError:
     PY7ZR_AVAILABLE = False
 
 # ── Konfigurasi ──────────────────────────────
-IMG_SIZE       = (80, 80)     # disesuaikan dgn resolusi sumber foto publik figur (~50-60px asli)
+IMG_SIZE       = (128, 128)     # disesuaikan dgn resolusi sumber foto publik figur (~50-60px asli)
 N_COMPONENTS   = 60           # diturunkan sedikit mengikuti dimensi fitur yg juga lebih kecil
 ALLOWED_EXT    = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 # Parameter LBP (Local Binary Pattern) -> fitur tekstur tahan-cahaya
 LBP_RADIUS     = 2
 LBP_N_POINTS   = 8 * LBP_RADIUS
-LBP_GRID       = (6, 6)       # grid lebih kecil krn IMG_SIZE juga lebih kecil (80x80)
+LBP_GRID       = (8, 8)       # grid lebih kecil krn IMG_SIZE juga lebih kecil (80x80)
 
 # Parameter Modular PCA (Gottumukkal & Asari, 2004) -> PCA terpisah per
 # sub-region wajah, supaya variasi lokal (ekspresi) tidak mendistorsi
@@ -274,7 +274,7 @@ def preprocess_image(img: np.ndarray, use_face_detection=True) -> np.ndarray:
 # recognition technique based on modular PCA approach. Pattern Recognition
 # Letters, 25(4), 429-436.
 
-MODULE_GRID = (3, 3)  # wajah dibagi 3x3 = 9 modul/sub-region
+MODULE_GRID = (4, 4)  # wajah dibagi 3x3 = 9 modul/sub-region
 
 
 def split_into_modules(aligned_face: np.ndarray, grid=MODULE_GRID) -> list:
@@ -1364,7 +1364,7 @@ with tab_compare:
             with wc2:
                 weight_euclidean = st.slider("Euclidean (Modular PCA)", 0.0, 1.0, 0.30, 0.05, key="w_euclidean")
             with wc3:
-                weight_ssim = st.slider("SSIM (Struktur Piksel)", 0.0, 1.0, 0.00, 0.05, key="w_ssim")
+                weight_ssim = st.slider("SSIM (Struktur Piksel)", 0.0, 1.0, 0.25, 0.05, key="w_ssim")
 
             total_weight_check = weight_cosine + weight_euclidean + weight_ssim
             if total_weight_check <= 0.01:
