@@ -1,4 +1,4 @@
-# Face RECOGNITION
+# Face Recognition
 
 Compare facial similarity between two photos using a self-trained PCA-based model.
 
