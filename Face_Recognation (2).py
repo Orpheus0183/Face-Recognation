@@ -926,9 +926,9 @@ def compare_faces(model: dict, img1: np.ndarray, img2: np.ndarray,
 
     combined = cos_sim * wc + euc_sim * we + ssim_sim * ws
 
-    if combined >= 0.50:
+    if combined >= 0.35:
         verdict, sub, level, emoji = "MIRIP", "Kemungkinan besar orang yang sama", "high", "✅"
-    elif combined >= 0.40:
+    elif combined >= 0.30:
         verdict, sub, level, emoji = "CUKUP MIRIP", "Mungkin orang yang sama", "medium", "🤔"
     else:
         verdict, sub, level, emoji = "TIDAK MIRIP", "Kemungkinan besar orang berbeda", "none", "❌"
@@ -1350,7 +1350,7 @@ with tab_compare:
         if st.session_state.get("__reset_weights"):
             st.session_state["w_cosine"] = 0.45
             st.session_state["w_euclidean"] = 0.30
-            st.session_state["w_ssim"] = 0.25
+            st.session_state["w_ssim"] = 0.00
             st.session_state["__reset_weights"] = False
 
         with st.expander("⚙️ Bobot Skor (lanjutan)", expanded=False):
@@ -1364,7 +1364,7 @@ with tab_compare:
             with wc2:
                 weight_euclidean = st.slider("Euclidean (Modular PCA)", 0.0, 1.0, 0.30, 0.05, key="w_euclidean")
             with wc3:
-                weight_ssim = st.slider("SSIM (Struktur Piksel)", 0.0, 1.0, 0.25, 0.05, key="w_ssim")
+                weight_ssim = st.slider("SSIM (Struktur Piksel)", 0.0, 1.0, 0.00, 0.05, key="w_ssim")
 
             total_weight_check = weight_cosine + weight_euclidean + weight_ssim
             if total_weight_check <= 0.01:
@@ -1374,7 +1374,7 @@ with tab_compare:
                     "ke nilai > 0, atau gunakan tombol reset di bawah.",
                     icon="⚠️",
                 )
-            if st.button("↺ Reset Bobot ke Default (0.45 / 0.30 / 0.25)"):
+            if st.button("↺ Reset Bobot ke Default (0.45 / 0.30 / 0.00)"):
                 st.session_state["__reset_weights"] = True
                 st.rerun()
 
@@ -1430,7 +1430,7 @@ with tab_compare:
                 st.caption(
                     f"⚙️ Model: {n_persons} orang, {n_samples} sampel training — "
                     f"Modular PCA + LBP + HOG + SSIM. "
-                    f"Skor ≥50% mirip · 40-49% cukup mirip · <40% tidak mirip."
+                    f"Skor ≥35% mirip · 30-34% cukup mirip · <30% tidak mirip."
                 )
 
             except Exception as e:
